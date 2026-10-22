@@ -36,6 +36,17 @@ are in the SQLite store deja already reads. Format verified
 against a 2026.8.2 store and openclaw source
 (`src/config/sessions/session-accessor.sqlite-*.ts`, `paths.ts`).
 
+A sub-agent (`sessions_spawn`) runs in a session of its own, and its entry
+names the session that asked for it (`spawnedBySessionId`, or the requester's
+key in `parent_session_key` / `spawnedBy`, in the database or in
+`sessions.json`), so `deja show` names the parent and the parent lists its
+children. A child spawned with `context: "fork"`, and a branch, opens on a
+header whose `parentSession` names the source, followed by the source's
+entries copied with their original times; deja reads only what comes after
+the header, so the copy is not credited to the child in search or blame. The
+`<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>` blocks OpenClaw wraps around a
+sub-agent's task are dropped from the turn. Verified against 2026.10.4.
+
 - **Plugin package**: `openclaw plugins install clawhub:@vshulcz/openclaw-deja` (also on npm) — `before_prompt_build` recall plus `deja_recall`, `deja_fix`, `deja_blame`; stands down on whatever `deja install openclaw-auto` already wired.
 - **MCP**: `deja install openclaw` wires deja into `openclaw.json` under
   `mcp.servers` (OpenClaw's own layout, not the common `mcpServers` root).
@@ -54,7 +65,19 @@ against a 2026.8.2 store and openclaw source
   result middleware adds a file's history after a read, edit or patch and the
   earlier fix after a failed command. The hook pack
   adds the digest at `agent:bootstrap`, which fires only in gateway mode.
-- **Resume**: `openclaw chat --session <key>`. OpenClaw addresses a
+  `openclaw chat` and `openclaw tui --local` run no plugin or hook
+  (2026.10.4), so none of this reaches them; MCP recall there leaves out the
+  session OpenClaw wrote to last when no hook stamped one.
+  A section openclaw.json keeps in its own file (`"mcp": {"$include": …}`)
+  is refused rather than written beside, with what to add there by hand: a
+  key next to the `$include` makes OpenClaw's own edits of that section land
+  in openclaw.json.
+- **Resume**: `openclaw tui --session <key>` when a gateway answers where the
+  TUI connects (`OPENCLAW_GATEWAY_URL`, `gateway.remote.url` in remote mode,
+  else 127.0.0.1 on `gateway.port`, default 18789), so the plugin and hooks
+  run there; otherwise `openclaw chat --session <key>` and a line saying the
+  local mode has no digest or recall (#5337). Both take the same key: one TUI,
+  one key resolver (2026.7.1-2). OpenClaw addresses a
   conversation by key (`agent:<id>:<name>`); the uuid its transcript is named
   after opens nothing. Legacy JSONL sessions use `sessions.json` beside the
   transcripts; SQLite sessions use the store's current-session mapping. An
@@ -62,7 +85,10 @@ against a 2026.8.2 store and openclaw source
   under its old id. Live-verified for JSONL: the terminal UI came up on
   `agent:main:main` with that session's history, and a run through
   `openclaw agent --session-id` answered from it. SQLite key lookup is covered
-  by synthetic database tests.
-- **Handoff**: exec, `openclaw chat --message <prompt>` sends it once the TUI connects.
+  by synthetic database tests. A spawned sub-agent has a key of its own
+  (`agent:main:subagent:<id>`), and `openclaw chat --session` on it loads the
+  child's history (2026.10.4, #5303).
+- **Handoff**: exec, `openclaw tui --message <prompt>` (or `openclaw chat` with
+  no gateway, said so) sends it once the TUI connects.
 
 **Last verified:** 2026-09-02

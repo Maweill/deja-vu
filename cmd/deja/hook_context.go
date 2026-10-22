@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -225,7 +227,10 @@ func precompactHarnessArg(args []string) string {
 func withoutSubagentRuns(ss []model.Session) []model.Session {
 	out := make([]model.Session, 0, len(ss))
 	for _, s := range ss {
-		if s.Kind == "sidechain" || s.Kind == "cron" {
+		// "sidechain" is Claude's word for the edge; Gemini, Codex, Cursor and
+		// the rest say "subagent", Grok "subagent_fork" too (#5215). The same
+		// words recall leaves out of a session's own lineage.
+		if index.SpawnedKind(s.Kind) || s.Kind == "cron" {
 			continue
 		}
 		out = append(out, s)
@@ -233,20 +238,40 @@ func withoutSubagentRuns(ss []model.Session) []model.Session {
 	return out
 }
 
-// codexThreadHasDigest reports whether a Codex thread starting now already
-// carries a start digest. Codex keeps the context a hook added in the thread
-// and replays it on resume, so every `codex resume` put the same digest in
-// front of the model once more, and a fork, which copies its source's history,
-// one more again (#4550). Claude Code drops the old one on resume and is not
-// asked. Read off what deja told the thread, or the thread it was forked from:
-// a thread whose ledger rows have rotated out gets one more, which is the old
-// behaviour.
-func codexThreadHasDigest(dir, source, sessionID, transcript string) bool {
+// threadHasDigest reports whether a session starting now already carries a
+// start digest. Codex keeps the context a hook added in the thread and replays
+// it on resume, so every `codex resume` put the same digest in front of the
+// model once more, and a fork, which copies its source's history, one more
+// again (#4550). For Codex that is read off what deja told the thread, or the
+// thread it was forked from: a thread whose ledger rows have rotated out gets
+// one more, which is the old behaviour.
+//
+// Claude Code did not replay it on 2.1.287 and does from 2.1.300 on: the answer
+// is stored as an attachment in the transcript and resent on resume (#5122).
+// There the transcript says, so an older client that never stored one, or a
+// session compacted since, still gets its digest. Every Claude-format host
+// reads as "claude" here; one that stored the record without replaying it
+// would lose its resume digest, and none is known to.
+func threadHasDigest(dir, source, sessionID, transcript string) bool {
 	if transcript == "" || sessionID == "" || source == "compact" || source == "clear" {
 		return false
 	}
+	// Grok Build keeps the tool-hook reminder the digest went out in and sends
+	// it again on resume, and a --fork-session copy starts with its source's:
+	// every `grok -r` added one more digest to the request, and a fork got a
+	// third led by the session it was forked from. chat_history.jsonl is what
+	// the model is sent, so it says.
+	if sources.IsGrokTranscript(transcript) {
+		return sources.GrokChatHolds(transcript, sessionStartMarker)
+	}
 	head, err := sources.TranscriptHead(transcript, sessionID)
-	if err != nil || head.Harness != "codex" {
+	if err != nil {
+		return false
+	}
+	if head.Harness == "claude" {
+		return source == "resume" && claudeTranscriptHoldsDigest(transcript)
+	}
+	if head.Harness != "codex" {
 		return false
 	}
 	told := func(id string) bool { return len(alreadyInjected(dir, sessionStartKeyPrefix+id)) > 0 }
@@ -254,6 +279,40 @@ func codexThreadHasDigest(dir, source, sessionID, transcript string) bool {
 		return true
 	}
 	return head.Kind == "fork" && head.Parent != "" && told(head.Parent)
+}
+
+// claudeTranscriptHoldsDigest reports whether a Claude Code transcript holds a
+// deja start digest the client will send again: a SessionStart attachment
+// carrying a recall block, after the last compaction boundary.
+func claudeTranscriptHoldsDigest(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	r := bufio.NewReaderSize(f, 64<<10)
+	held := false
+	for {
+		line, err := r.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			// A record's type and hook name sit at its front, so the first
+			// 64 KiB of a long line is enough to tell; the rest is skipped.
+			line = append([]byte(nil), line...)
+			for errors.Is(err, bufio.ErrBufferFull) {
+				_, err = r.ReadSlice('\n')
+			}
+		}
+		switch {
+		case bytes.Contains(line, []byte(`"compact_boundary"`)):
+			held = false
+		case bytes.Contains(line, []byte(`"hook_additional_context"`)) &&
+			bytes.Contains(line, []byte(`"hookEvent":"SessionStart"`)) && bytes.Contains(line, []byte(`deja-recall`)):
+			held = true
+		}
+		if err != nil {
+			return held
+		}
+	}
 }
 
 // sessionHadDigest reports whether this session has already had its one
@@ -468,6 +527,11 @@ func recallIsOff() bool {
 // entire post-upgrade rebuild, while the statusline showed the progress bar
 // (#927).
 func buildNotice(dir string) string {
+	// Nothing builds on its own with automatic indexing off, so no promise of
+	// one: what is missing and the command that builds it (#5385).
+	if index.Manual() {
+		return manualIndexNote(dir)
+	}
 	if st := readWarmupStatus(dir); st != nil {
 		// On a machine no agent has written to, "indexing your history —
 		// recall comes online when it finishes" is deja's first word to an
@@ -581,9 +645,16 @@ func runHookContextMode(dir string, plain, once bool) error {
 		// question, so a first turn with nothing to say has nothing new to say
 		// on the second either.
 		Once bool `json:"deja_once"`
-		// Shell is set by a host with no deja tool for the agent to call: pi
-		// has no MCP of its own, and a lead naming recall_context sent the
-		// model to "Tool recall_context not found" on every first turn (#4584).
+		// PromptStamps is set by a host whose prompt hook runs on every turn
+		// a person asked for, so a digest call after the first is not what
+		// says the session is in use. OpenClaw fires agent:bootstrap on its
+		// heartbeat polls too, and the stamp they wrote hid the main DM from
+		// recall for twenty minutes after each poll (#5270).
+		PromptStamps bool `json:"deja_prompt_stamps"`
+		// Shell is set by a host that cannot count on a deja tool for the
+		// agent to call: pi before 0.99 has no MCP of its own, and a lead
+		// naming recall_context sent the model to "Tool recall_context not
+		// found" on every first turn (#4584).
 		Shell bool `json:"deja_shell"`
 		// The event that fired, when the payload names one. Devin sends
 		// hook_event_name and rejects a reply that names a different event
@@ -612,6 +683,9 @@ func runHookContextMode(dir string, plain, once bool) error {
 		shape = hookToolPlain
 	} else if copilotHookOutput {
 		shape = hookToolCopilot
+	}
+	if input.Once && input.PromptStamps && sessionHadDigest(dir, input.SessionID) {
+		return nil
 	}
 	// The first moment this session exists, so the first recall of it — the one
 	// an agent plans against — already knows whose transcript to leave out.
@@ -643,14 +717,22 @@ func runHookContextMode(dir string, plain, once bool) error {
 			return nil
 		}
 		rememberSessionDigest(dir, input.SessionID)
+		// A Kimi /fork is a copy of its source under a new id, the digest
+		// that opened the source among what it copied (#5146).
+		if src := sources.KimiForkSource(input.SessionID); src != "" && sessionHadDigest(dir, src) {
+			return nil
+		}
 	}
 	// Claude Code forks with source "fork", and the fork carries its source's
 	// turns, the digest that opened it among them. A second one led with the
 	// source itself, the fork's own opening under another id (#4549).
 	if input.Source == "fork" {
+		// Its first prompt and tool come before the copy is written; they
+		// learn the source from what this keeps (#5128).
+		rememberClaudeForkSource(dir, input.SessionID, input.TranscriptPath)
 		return nil
 	}
-	if codexThreadHasDigest(dir, input.Source, input.SessionID, input.TranscriptPath) {
+	if threadHasDigest(dir, input.Source, input.SessionID, input.TranscriptPath) {
 		return nil
 	}
 	input.WorkspaceRoots = adoptGrokRoots(input.WorkspaceRoots, input.WorkspaceRoot)
@@ -661,14 +743,25 @@ func runHookContextMode(dir string, plain, once bool) error {
 	// The session asking is left out of its own digest (#4199), except after a
 	// compaction: the lead there points the agent at that session's id.
 	var self []string
-	for id := range askerLineage(dir, input.SessionID, input.TranscriptPath, input.ParentSessionID) {
+	lineage, cut := askerLineageCut(dir, input.SessionID, input.TranscriptPath, input.ParentSessionID)
+	for id := range lineage {
 		if input.Source == "compact" && id == input.SessionID {
 			continue
 		}
 		self = append(self, id)
 	}
 	sort.Strings(self)
-	digest, sessions, raw, taskMatched, withheld, servedIDs, servedProjects := cachedHookDigestFor(dir, hookProjectPath(input.CWD, input.WorkspaceRoots), self...)
+	var digest string
+	var sessions, withheld int
+	var raw int64
+	var taskMatched, servedIDs, servedProjects []string
+	if len(cut) > 0 {
+		// A fork whose source went on: cut per asker, so not from the cache.
+		e := hookDigestBuild(dir, hookProjectPath(input.CWD, input.WorkspaceRoots), self, false, cut)
+		digest, sessions, raw, taskMatched, withheld, servedIDs, servedProjects = e.Digest, e.Sessions, e.Raw, e.TaskMatched, e.Withheld, e.IDs, e.Projects
+	} else {
+		digest, sessions, raw, taskMatched, withheld, servedIDs, servedProjects = cachedHookDigestFor(dir, hookProjectPath(input.CWD, input.WorkspaceRoots), self...)
+	}
 	if digest == "" {
 		// No session from this project, which is the usual state in a new
 		// checkout — and exactly where knowing what this machine is missing
@@ -756,20 +849,16 @@ func runHookContextMode(dir string, plain, once bool) error {
 	if input.Shell {
 		lead = shellRecallLead(lead)
 	}
-	starting := sync.OnceValue(func() string { return startingHarness(dir, input.SessionID, input.TranscriptPath) })
-	// What Claude wrote in its own memory here, for every agent but Claude,
-	// which already loads it. A session nothing identifies gets it: a line it
-	// has seen costs a few hundred bytes, one it never got costs a rule.
-	if h := starting(); h != "claude" && (h != "" || input.TranscriptPath == "" || !sources.UnderClaudeRoot(input.TranscriptPath)) {
-		if mb := claudeMemoryBlock(dir, hookCWD(hookProjectPath(input.CWD, input.WorkspaceRoots)), 8, 1000); mb != "" {
-			digest = mb + "\n" + digest
-		}
-	}
 	digest = lead + digest
-	if tip := limitHandoffTip(dir, hookCWD(hookProjectPath(input.CWD, input.WorkspaceRoots)), append(self, input.SessionID), starting); tip != "" {
+	if tip := limitHandoffTip(dir, hookCWD(hookProjectPath(input.CWD, input.WorkspaceRoots)), append(self, input.SessionID), func() string {
+		return startingHarness(dir, input.SessionID, input.TranscriptPath)
+	}); tip != "" {
 		digest += "\n" + tip
 	}
 	digest = frameRecall(digest)
+	if line := manualIndexLine(dir); line != "" {
+		digest += "\n" + line
+	}
 	polName := policy.Load().Describe(policy.ActivationAuto)
 	if unreadable {
 		usage.RecordDigestPolicySessionsUnread(dir, usage.KindHook, digest, input.SessionID, sessions, raw, polName, servedIDs, servedProjects)
@@ -1051,7 +1140,13 @@ func (e hookCacheEntry) servedWithout(exclude ...string) (hookDigestVariant, boo
 		return hookDigestVariant{Digest: e.Digest, Sessions: e.Sessions, Raw: e.Raw, TaskMatched: e.TaskMatched, IDs: e.IDs, Projects: e.Projects}, true
 	case 1:
 		v, ok := e.Without[in[0]]
-		return v, ok
+		// The variant backfills from the sessions behind the digest, and a
+		// fork leaves out its sources too, which the full digest may not hold
+		// (#5138).
+		if !ok || slices.ContainsFunc(exclude, func(id string) bool { return id != "" && slices.Contains(v.IDs, id) }) {
+			return hookDigestVariant{}, false
+		}
+		return v, true
 	}
 	return hookDigestVariant{}, false
 }
@@ -1287,14 +1382,14 @@ func hookDigestResult(dir string) (string, int, int64, []string, int, []string, 
 // environment, where a project deja itself had written stayed for every later
 // call in the process (#2182, #2185).
 func hookDigestResultFor(dir, fromPayload string, exclude ...string) (string, int, int64, []string, int, []string, []string) {
-	e := hookDigestBuild(dir, fromPayload, exclude, false)
+	e := hookDigestBuild(dir, fromPayload, exclude, false, nil)
 	return e.Digest, e.Sessions, e.Raw, e.TaskMatched, e.Withheld, e.IDs, e.Projects
 }
 
 // hookDigestEntryFor is the digest as the cache keeps it: with every session
 // it serves, and as it reads with each of them left out.
 func hookDigestEntryFor(dir, fromPayload string) hookCacheEntry {
-	return hookDigestBuild(dir, fromPayload, nil, true)
+	return hookDigestBuild(dir, fromPayload, nil, true, nil)
 }
 
 // withProjectsOf adds the projects of sessions already chosen to a name list,
@@ -1319,7 +1414,9 @@ func withProjectsOf(names []string, ss []model.Session) []string {
 // cache hit from a rebuild.
 var hookDigestRenders atomic.Int64
 
-func hookDigestBuild(dir, fromPayload string, exclude []string, variants bool) (entry hookCacheEntry) {
+// cut leaves out each session's records at or before its time, the turns a
+// fork asking already holds as its copy of a source that went on (#5335).
+func hookDigestBuild(dir, fromPayload string, exclude []string, variants bool, cut map[string]time.Time) (entry hookCacheEntry) {
 	withheld := 0
 	defer func() { _ = recover() }()
 	trace := os.Getenv("DEJA_TRACE") == "1"
@@ -1454,6 +1551,12 @@ func hookDigestBuild(dir, fromPayload string, exclude []string, variants bool) (
 	render := func(exclude []string) hookCacheEntry {
 		hookDigestRenders.Add(1)
 		ss := slices.DeleteFunc(slices.Clone(ss), func(s model.Session) bool { return s.ID != "" && slices.Contains(exclude, s.ID) })
+		if len(cut) > 0 {
+			ss = slices.DeleteFunc(ss, func(s model.Session) bool { return len(cutSessionAt(s, cut).Messages) == 0 })
+			for i := range ss {
+				ss[i] = cutSessionAt(ss[i], cut)
+			}
+		}
 		// A subagent run is the parent's work seen from inside, and what it says
 		// on its own is the process talk a spawned agent produces — "Sending
 		// verdict", "Worktrees cleaned up". Indexing already treats these runs as
@@ -1619,7 +1722,7 @@ func warmupLooksDead(dir string, now time.Time, stamp int64) bool {
 }
 
 func requestWarmup(dir string) {
-	if os.Getenv("DEJA_WARMUP_SENTINEL") != "" || installBuildsIndex {
+	if os.Getenv("DEJA_WARMUP_SENTINEL") != "" || installBuildsIndex || index.Manual() {
 		return
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -1906,6 +2009,9 @@ func shellRecallLead(lead string) string {
 // wideRecallLead is sessionStartLead for DEJA_RECALL=aggressive, where the
 // sessions come from this machine rather than from this checkout.
 const wideRecallLead = "The sessions below are recent work on this machine, not only in this project — deja is set to recall widely. If any is relevant to what the user asks next, call recall_context with the session id printed beside it — an id is exact, a phrase is a guess — to pull the full details before acting. \nIf one of these helps, open your reply with that one line and nothing more about it: déjà vu: <what it said> — reusing it (deja:<session id>). If none helps, say nothing about them.\n"
+
+// sessionStartMarker is how a start digest opens, under either lead.
+const sessionStartMarker = recallFrameHeader + "The sessions below are "
 
 const sessionStartLead = "The sessions below are from this project's recent history. If any is relevant to what the user asks next, call recall_context with the session id printed beside it — an id is exact, a phrase is a guess — to pull the full details before acting. \nIf one of these helps, open your reply with that one line and nothing more about it: déjà vu: <what it said> — reusing it (deja:<session id>). If none helps, say nothing about them.\n"
 

@@ -279,7 +279,7 @@ func attributeByWritten(sessions []model.Session, target search.BlameTarget, c l
 				continue
 			}
 			path, has := sources.WroteRecordHas(m.Text, want)
-			if !has || !recordNamesFile(path, target) {
+			if !has || !search.RecordNamesFile(path, target) {
 				continue
 			}
 			// A session that wrote it after the commit wrote something else:
@@ -287,7 +287,7 @@ func attributeByWritten(sessions []model.Session, target search.BlameTarget, c l
 			if !m.Time.IsZero() && !c.When.IsZero() && m.Time.After(c.When) {
 				continue
 			}
-			if best.Matched == "" || m.Time.After(bestAt) {
+			if best.Matched == "" || m.Time.After(bestAt) || (m.Time.Equal(bestAt) && search.SourceOf(sessions, s, best.Session, m.Time)) {
 				best = lineAuthor{
 					Session: s,
 					Matched: blameSpanKey(line),
@@ -338,7 +338,7 @@ func attributeByReplaced(sessions []model.Session, target search.BlameTarget, c 
 			}
 			// An edit record is "path\n<the text that was replaced>".
 			path, span, ok := strings.Cut(m.Text, "\n")
-			if !ok || !recordNamesFile(path, target) {
+			if !ok || !search.RecordNamesFile(path, target) {
 				continue
 			}
 			// After the commit it cannot be what the commit removed.
@@ -354,7 +354,7 @@ func attributeByReplaced(sessions []model.Session, target search.BlameTarget, c 
 				// repository on the same store, 3 of 17 attributed commits had
 				// a second candidate. The last one to write it before the
 				// commit is the one the commit carried (#3723).
-				if best.Matched == "" || m.Time.After(bestAt) {
+				if best.Matched == "" || m.Time.After(bestAt) || (m.Time.Equal(bestAt) && search.SourceOf(sessions, s, best.Session, m.Time)) {
 					best = lineAuthor{Session: s, Matched: key, Asked: search.SessionTitle(s), Said: saidBefore(s, i)}
 					bestAt = m.Time
 				}
@@ -363,32 +363,6 @@ func attributeByReplaced(sessions []model.Session, target search.BlameTarget, c 
 		}
 	}
 	return best, best.Matched != ""
-}
-
-// recordNamesFile reports whether a recorded path names the file asked about. The
-// recorded one is absolute and may come from a worktree or another machine, so
-// the comparison is on the tail.
-func recordNamesFile(recorded string, target search.BlameTarget) bool {
-	recorded = strings.TrimSpace(strings.ReplaceAll(recorded, "\\", "/"))
-	if recorded == "" {
-		return false
-	}
-	want := filepath.ToSlash(target.FullPath)
-	if recorded == want {
-		return true
-	}
-	// A worktree or a peer's checkout: the repository-relative tail is what
-	// both have in common. Two segments is enough to tell `pool.go` in two
-	// packages apart and short enough to survive a different checkout root.
-	return strings.HasSuffix(recorded, "/"+tailSegments(want, 2)) && strings.HasSuffix(want, "/"+tailSegments(recorded, 2))
-}
-
-func tailSegments(p string, n int) string {
-	parts := strings.Split(strings.Trim(p, "/"), "/")
-	if len(parts) <= n {
-		return strings.Join(parts, "/")
-	}
-	return strings.Join(parts[len(parts)-n:], "/")
 }
 
 // No "why" line is printed, and that is a measured decision rather than an

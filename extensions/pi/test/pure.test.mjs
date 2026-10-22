@@ -2,10 +2,16 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
-import { argv, contextText, installerExtensionPath, installerExtensionPaths, sessionKey } from "../lib.mjs"
+import { argv, branchHoldsRecall, contextText, installerExtensionPath, installerExtensionPaths, sessionKey } from "../lib.mjs"
 
 test("the installer's extension is looked for where the installer writes it", () => {
   assert.equal(installerExtensionPath("/home/u"), "/home/u/.pi/agent/extensions/deja.ts")
+})
+
+test("PI_CODING_AGENT_DIR moves the installer's extension with pi", () => {
+  assert.equal(installerExtensionPath("/home/u", { PI_CODING_AGENT_DIR: "/srv/pi" }), "/srv/pi/extensions/deja.ts")
+  assert.equal(installerExtensionPath("/home/u", { PI_CODING_AGENT_DIR: "~/alt" }), "/home/u/alt/extensions/deja.ts")
+  assert.equal(installerExtensionPath("/home/u", { PI_CODING_AGENT_DIR: "" }), "/home/u/.pi/agent/extensions/deja.ts")
 })
 
 test("hook-context is read in both shapes deja prints", () => {
@@ -50,4 +56,16 @@ test("index.ts loads under node's type stripping, the way pi loads it", () => {
     { cwd: dir, encoding: "utf8" },
   )
   assert.equal(out.trim(), "function")
+})
+
+test("a branch holds recall when pi still sends the block to the model", () => {
+  const block = { type: "custom_message", customType: "deja-recall", id: "b" }
+  assert.equal(branchHoldsRecall([]), false)
+  assert.equal(branchHoldsRecall([{ type: "message", id: "a" }, block]), true)
+  assert.equal(branchHoldsRecall([{ type: "custom_message", customType: "other" }]), false)
+  // Gone with a compaction, unless the compaction kept it.
+  assert.equal(branchHoldsRecall([block, { type: "compaction" }]), false)
+  assert.equal(branchHoldsRecall([block, { type: "message", id: "c" }, { type: "compaction", firstKeptEntryId: "c" }]), false)
+  assert.equal(branchHoldsRecall([{ type: "message", id: "a" }, block, { type: "compaction", firstKeptEntryId: "a" }]), true)
+  assert.equal(branchHoldsRecall([block, { type: "compaction", firstKeptEntryId: "b" }]), true)
 })

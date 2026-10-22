@@ -62,6 +62,11 @@ type claudeLine struct {
 	// ends in the session_01… id a person copies from claude.ai/code (#4667).
 	Subtype string `json:"subtype"`
 	URL     string `json:"url"`
+	// ForkedFrom is stamped on every record a /branch copied out of its
+	// source (2.1.302); its sessionId is the session the branch came from.
+	ForkedFrom *struct {
+		SessionID string `json:"sessionId"`
+	} `json:"forkedFrom"`
 }
 
 type claudeMessage struct {
@@ -107,6 +112,7 @@ func parseClaudeTypedWithOptions(path string, scan func(func([]byte)) error,
 	// Where each Bash call's record landed, so the result that arrives later
 	// can stamp its outcome onto it.
 	commandAt := map[string][]int{}
+	forkedFrom := ""
 	s := model.Session{
 		Harness: harness,
 		ID:      strings.TrimSuffix(filepath.Base(path), ".jsonl"),
@@ -124,6 +130,9 @@ func parseClaudeTypedWithOptions(path string, scan func(func([]byte)) error,
 				s.RemoteID = id
 			}
 			return
+		}
+		if v.ForkedFrom != nil && forkedFrom == "" {
+			forkedFrom = v.ForkedFrom.SessionID
 		}
 		if v.Type != "user" && v.Type != "assistant" {
 			return
@@ -147,18 +156,25 @@ func parseClaudeTypedWithOptions(path string, scan func(func([]byte)) error,
 		s.Touch(t)
 		role := v.Type
 		txt := ""
+		// Split once: each reader below used to decode the content array
+		// itself, six copies of every tool output per line (#5586).
+		var content *claudeContent
 		if v.Message != nil {
+			content = splitClaudeContent(v.Message.Content)
 			if v.Message.Role != "" {
 				role = v.Message.Role
 			}
 			var toolOut bool
-			txt, toolOut = claudeTextKind(v.Message.Content)
+			txt, toolOut = claudeTextKindIn(content)
 			if toolOut {
 				role = RoleToolOutput
 			}
 		}
 		if v.Type == "user" && v.IsCompactSummary && role == "user" {
 			role = RoleSummary
+		}
+		if role == "user" {
+			txt = UnwrapPastedContent(txt)
 		}
 		if txt != "" {
 			// A snapshot run is one reply: the later record carries the longer
@@ -178,22 +194,22 @@ func parseClaudeTypedWithOptions(path string, scan func(func([]byte)) error,
 		}
 		if v.Message != nil {
 			if IndexToolPaths() {
-				if p := claudeToolPaths(v.Message.Content); p != "" {
+				if p := claudeToolPathsIn(content); p != "" {
 					s.Messages = append(s.Messages, model.Message{Role: RoleFiles, Text: p, Time: t})
 				}
 			}
 			if IndexEdits() {
-				for _, e := range claudeEditSpans(v.Message.Content) {
+				for _, e := range claudeEditSpansIn(content) {
 					s.Messages = append(s.Messages, model.Message{Role: RoleEdit, Text: e, Time: t})
 				}
 			}
 			if IndexWrites() {
-				for _, w := range claudeWroteRecords(v.Message.Content) {
+				for _, w := range claudeWroteRecordsIn(content) {
 					s.Messages = append(s.Messages, model.Message{Role: RoleWrote, Text: w, Time: t})
 				}
 			}
 			if IndexCommands() {
-				for _, cmd := range claudeCommands(v.Message.Content) {
+				for _, cmd := range claudeCommandsIn(content) {
 					if cmd.ID != "" {
 						// One call can carry a batch of commands, and the
 						// filter drops some of them, so the indexes under one
@@ -206,7 +222,7 @@ func parseClaudeTypedWithOptions(path string, scan func(func([]byte)) error,
 				// the marker every other harness writes. A failure is stamped
 				// only with the code its result names; nothing is invented for
 				// one that names none.
-				for _, res := range claudeToolOutcomes(v.Message.Content) {
+				for _, res := range claudeToolOutcomesIn(content) {
 					if _, ok := commandAt[res.ID]; !ok || !res.Known {
 						continue
 					}
@@ -219,10 +235,11 @@ func parseClaudeTypedWithOptions(path string, scan func(func([]byte)) error,
 	if len(s.Messages) == 0 {
 		return nil, err
 	}
+	markClaudeBranch(&s, forkedFrom)
 	// A child run comes in as the task it was handed, the answer it came back
 	// with and what it changed, unless the reader asked for the whole thing
 	// (#3009, #4163).
-	if IsSubagentPath(path) && os.Getenv("DEJA_INCLUDE_SUBAGENTS") != "1" {
+	if IsSubagentPath(path) && !SubagentsWhole() {
 		s.Messages = KeepSubagentTail(s.Messages)
 	}
 	// The directory a session was started from is a weak guess at what it was
@@ -233,6 +250,16 @@ func parseClaudeTypedWithOptions(path string, scan func(func([]byte)) error,
 		s.ProjectFromDir = true
 	}
 	return []model.Session{s}, err
+}
+
+// markClaudeBranch records a /branch's source, which the harness wrote on the
+// records it copied. Without it the branch read as unrelated work, and blame
+// credited it with the edits it had only copied. --fork-session writes no
+// marker, so those forks stay unmarked.
+func markClaudeBranch(s *model.Session, forkedFrom string) {
+	if forkedFrom != "" && forkedFrom != s.ID && s.Kind == "" {
+		s.Kind, s.Parent = "fork", forkedFrom
+	}
 }
 
 // claudeTime accepts the two shapes a transcript uses. Numbers keep going
@@ -282,8 +309,12 @@ const RoleToolOutput = "tool-output"
 // from tool results rather than from speech. A message mixing both counts as
 // speech: the person said something, and the tool output rode along with it.
 func claudeTextKind(raw json.RawMessage) (string, bool) {
+	return claudeTextKindIn(splitClaudeContent(raw))
+}
+
+func claudeTextKindIn(c *claudeContent) (string, bool) {
 	var sawToolResult, sawSpeech bool
-	raw = trimJSONSpace(raw)
+	raw := c.raw
 	if len(raw) == 0 {
 		return "", false
 	}
@@ -294,15 +325,11 @@ func claudeTextKind(raw json.RawMessage) (string, bool) {
 		}
 		return s, false
 	}
-	if raw[0] != '[' {
-		return "", false
-	}
-	var items []json.RawMessage
-	if json.Unmarshal(raw, &items) != nil {
+	if !c.array {
 		return "", false
 	}
 	var b strings.Builder
-	for _, item := range items {
+	for _, item := range c.items {
 		item = trimJSONSpace(item)
 		if len(item) == 0 || item[0] != '{' {
 			continue
@@ -321,6 +348,9 @@ func claudeTextKind(raw json.RawMessage) (string, bool) {
 		}
 		if part.Type == "tool_result" {
 			sawToolResult = true
+			if !IndexToolOutput() {
+				continue
+			}
 		} else if chunk != "" {
 			sawSpeech = true
 		}
@@ -333,6 +363,47 @@ func claudeTextKind(raw json.RawMessage) (string, bool) {
 		b.WriteString(chunk)
 	}
 	return b.String(), sawToolResult && !sawSpeech
+}
+
+// claudeContent is a message's content with its array split into items once,
+// for every reader of one line to share.
+type claudeContent struct {
+	raw   json.RawMessage
+	items []json.RawMessage
+	// array is whether raw is an array that decoded.
+	array bool
+	// kind is each item's "type", decoded on first use; known says whether
+	// it decoded.
+	kind  []string
+	known []bool
+}
+
+func splitClaudeContent(raw json.RawMessage) *claudeContent {
+	c := &claudeContent{raw: trimJSONSpace(raw)}
+	if len(c.raw) > 0 && c.raw[0] == '[' && json.Unmarshal(c.raw, &c.items) == nil {
+		c.array = true
+	}
+	return c
+}
+
+// notType reports that item i is an object of another type than want. A
+// reader that keeps only one type can skip such an item without decoding it
+// into its own struct: that decode reads the same "type" key, so it would
+// skip it too. An item whose type does not decode is never skipped here.
+func (c *claudeContent) notType(i int, want string) bool {
+	if c.kind == nil {
+		c.kind = make([]string, len(c.items))
+		c.known = make([]bool, len(c.items))
+		for j, item := range c.items {
+			var part struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(item, &part) == nil {
+				c.kind[j], c.known[j] = part.Type, true
+			}
+		}
+	}
+	return c.known[i] && c.kind[i] != want
 }
 
 // claudeContentText reads an item's content field. Most tool results carry it
@@ -407,6 +478,11 @@ var jsonlReaders = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 1
 
 // scanJSONLBytes hands each line to the caller without copying it or building a
 // decoder for it. The slice is only valid for the duration of the call.
+//
+// A line longer than the buffer is decoded as it streams and handed on
+// re-encoded, its strings cut at longStringCap: read whole, a 100 MB tool
+// output line was held as the line, the decoded content and the joined text
+// (#5414).
 func scanJSONLBytes(path string, offset int64, fn func([]byte)) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -424,7 +500,10 @@ func scanJSONLBytes(path string, offset int64, fn func([]byte)) error {
 	defer func() { r.Reset(nil); jsonlReaders.Put(r) }()
 	r.Reset(boundedFrom(path, f, offset))
 	for {
-		line, err := r.ReadBytes('\n')
+		line, partial, err := readLineBytes(r)
+		if partial {
+			return nil
+		}
 		if trimmed := trimJSONSpace(line); len(trimmed) > 0 {
 			// A last line with no newline that does not parse is the client
 			// still writing it, not a broken line: the next pass reads it
@@ -482,20 +561,17 @@ func claudeCallPath(filePath, notebookPath string) string {
 
 // claudeToolPaths returns the distinct file paths a message's tool calls name,
 // one per line, or "" when it names none.
-func claudeToolPaths(raw json.RawMessage) string {
-	raw = trimJSONSpace(raw)
-	if len(raw) == 0 || raw[0] != '[' {
-		return ""
-	}
-	var items []json.RawMessage
-	if json.Unmarshal(raw, &items) != nil {
+func claudeToolPaths(raw json.RawMessage) string { return claudeToolPathsIn(splitClaudeContent(raw)) }
+
+func claudeToolPathsIn(c *claudeContent) string {
+	if !c.array {
 		return ""
 	}
 	var out []string
 	seen := map[string]bool{}
-	for _, item := range items {
+	for i, item := range c.items {
 		item = trimJSONSpace(item)
-		if len(item) == 0 || item[0] != '{' {
+		if len(item) == 0 || item[0] != '{' || c.notType(i, "tool_use") {
 			continue
 		}
 		var part struct {
@@ -541,19 +617,16 @@ const editSpanMax = 32 * 1024
 
 // claudeEditSpans returns "path\nreplaced bytes" for every edit in a turn,
 // including the sub-edits of a MultiEdit call.
-func claudeEditSpans(raw json.RawMessage) []string {
-	raw = trimJSONSpace(raw)
-	if len(raw) == 0 || raw[0] != '[' {
-		return nil
-	}
-	var items []json.RawMessage
-	if json.Unmarshal(raw, &items) != nil {
+func claudeEditSpans(raw json.RawMessage) []string { return claudeEditSpansIn(splitClaudeContent(raw)) }
+
+func claudeEditSpansIn(c *claudeContent) []string {
+	if !c.array {
 		return nil
 	}
 	var out []string
-	for _, item := range items {
+	for i, item := range c.items {
 		item = trimJSONSpace(item)
-		if len(item) == 0 || item[0] != '{' {
+		if len(item) == 0 || item[0] != '{' || c.notType(i, "tool_use") {
 			continue
 		}
 		var part struct {
@@ -600,18 +673,17 @@ func claudeEditSpans(raw json.RawMessage) []string {
 // the new side of an Edit, of each sub-edit of a MultiEdit, and the whole
 // content of a Write. The mirror of claudeEditSpans, which takes the old side.
 func claudeWroteRecords(raw json.RawMessage) []string {
-	raw = trimJSONSpace(raw)
-	if len(raw) == 0 || raw[0] != '[' {
-		return nil
-	}
-	var items []json.RawMessage
-	if json.Unmarshal(raw, &items) != nil {
+	return claudeWroteRecordsIn(splitClaudeContent(raw))
+}
+
+func claudeWroteRecordsIn(c *claudeContent) []string {
+	if !c.array {
 		return nil
 	}
 	var out []string
-	for _, item := range items {
+	for i, item := range c.items {
 		item = trimJSONSpace(item)
-		if len(item) == 0 || item[0] != '{' {
+		if len(item) == 0 || item[0] != '{' || c.notType(i, "tool_use") {
 			continue
 		}
 		var part struct {
@@ -768,18 +840,17 @@ type claudeCommand struct {
 
 // claudeCommands pulls the shell commands worth keeping out of a message.
 func claudeCommands(raw json.RawMessage) []claudeCommand {
-	raw = trimJSONSpace(raw)
-	if len(raw) == 0 || raw[0] != '[' {
-		return nil
-	}
-	var items []json.RawMessage
-	if json.Unmarshal(raw, &items) != nil {
+	return claudeCommandsIn(splitClaudeContent(raw))
+}
+
+func claudeCommandsIn(c *claudeContent) []claudeCommand {
+	if !c.array {
 		return nil
 	}
 	var out []claudeCommand
-	for _, item := range items {
+	for i, item := range c.items {
 		item = trimJSONSpace(item)
-		if len(item) == 0 || item[0] != '{' {
+		if len(item) == 0 || item[0] != '{' || c.notType(i, "tool_use") {
 			continue
 		}
 		var part struct {
@@ -817,19 +888,14 @@ type claudeToolOutcome struct {
 	Known bool
 }
 
-func claudeToolOutcomes(raw json.RawMessage) []claudeToolOutcome {
-	raw = trimJSONSpace(raw)
-	if len(raw) == 0 || raw[0] != '[' {
-		return nil
-	}
-	var items []json.RawMessage
-	if json.Unmarshal(raw, &items) != nil {
+func claudeToolOutcomesIn(c *claudeContent) []claudeToolOutcome {
+	if !c.array {
 		return nil
 	}
 	var out []claudeToolOutcome
-	for _, item := range items {
+	for i, item := range c.items {
 		item = trimJSONSpace(item)
-		if len(item) == 0 || item[0] != '{' {
+		if len(item) == 0 || item[0] != '{' || c.notType(i, "tool_result") {
 			continue
 		}
 		var part struct {

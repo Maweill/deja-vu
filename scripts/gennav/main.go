@@ -87,6 +87,8 @@ var groups = []group{
 		{"delete-kimi-code-session-history.html", "Kimi Code"},
 		{"delete-windsurf-cascade-history.html", "Windsurf"},
 		{"delete-qwen-code-chat-history.html", "Qwen Code"},
+		{"delete-trae-sessions.html", "TRAE CLI"},
+		{"delete-codebuddy-sessions.html", "CodeBuddy"},
 	}},
 	{title: "Per-agent guides", fold: true, links: []link{
 		{"memory-for-aider.html", "aider"},

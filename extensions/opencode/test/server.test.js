@@ -72,6 +72,7 @@ case "$1" in
   hook-tool-after) echo '{"hookSpecificOutput":{"additionalContext":"ran next: go mod tidy"}}' ;;
   hook-precompact) cat > "${join(dir, "precompact.json")}" ;;
   search) echo 'found it' ;;
+  recall) echo "page $*" ;;
   --framed) echo "framed $2" ;;
   *) echo 0.0.0 ;;
 esac
@@ -132,7 +133,10 @@ test("setup wires every channel the 1.x hooks have onto 2.x's seams", async () =
     for (const t of tools) assert.deepEqual(t.options, { codemode: false }, `${t.name} is not a direct tool`)
     const recall = tools[0]
     assert.deepEqual(recall.input.required, ["query"])
-    assert.deepEqual(await recall.execute({ query: "flake" }), { content: "framed search" })
+    // The recall page, which deja frames and budgets itself, not search --json.
+    assert.deepEqual(await recall.execute({ query: "flake" }), { content: "page recall --limit 5 flake" })
+    assert.deepEqual(await recall.execute({ query: "flake", offset: 5 }), { content: "page recall --limit 5 --offset 5 flake" })
+    assert.ok(recall.input.properties.offset, "deja_recall takes no offset on 2.x")
 
     assert.equal(hooks.session.context.length, 1)
     assert.equal(hooks.session.compaction.length, 1)
@@ -235,7 +239,7 @@ test("on 2.x the sessions it stamped end with the turn and at cleanup", async ()
     await events.push({ type: "session.execution.started", data: { sessionID: "s1" } })
     assert.equal(ended().length, 0, "a turn starting ended the session")
     await events.push({ type: "session.execution.succeeded", data: { sessionID: "s1" } })
-    assert.deepEqual(ended(), ['hook-session-end {"session_id":"s1"}'])
+    assert.deepEqual(ended(), ['hook-session-end ' + JSON.stringify({ session_id: "s1", cwd: dir })])
     await hooks.session.context[0]({
       sessionID: "s2",
       system: [],
@@ -244,7 +248,7 @@ test("on 2.x the sessions it stamped end with the turn and at cleanup", async ()
     rmSync(calls, { force: true })
     await cleanup()
     // s1's turn already ended it; the cleanup ends only what is still live.
-    assert.deepEqual(ended(), ['hook-session-end {"session_id":"s2"}'])
+    assert.deepEqual(ended(), ['hook-session-end ' + JSON.stringify({ session_id: "s2", cwd: dir })])
     assert.equal(events.open(), false, "the subscription outlived the plugin")
   })
 })

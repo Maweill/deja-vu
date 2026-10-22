@@ -57,6 +57,19 @@ var codexHookWiring = []hookWire{
 	{"SessionEnd", "hook-session-end", ""},
 }
 
+// codexHookTimeout is the timeout deja writes for a codex hook, in seconds.
+// codex-cli 0.149.0 caps SessionEnd at 3 s and warns on every start when the
+// file asks for more (#5126); the hook only drops the live stamp, so 3 s is
+// plenty. Every other event keeps 10.
+func codexHookTimeout(event string) int {
+	if event == "SessionEnd" {
+		return codexSessionEndCap
+	}
+	return 10
+}
+
+const codexSessionEndCap = 3
+
 func installCodexHooks(exe string, uninstall bool) (installResult, error) {
 	// Use CodexHome() (honours CODEX_HOME / DEJA_CODEX_ROOT) rather than a raw
 	// ~/.codex join, so a sandboxed install stays sandboxed and a non-default
@@ -132,6 +145,12 @@ func updateCodexHook(root map[string]any, event, cmd, matcher string, uninstall 
 			}
 			found = true
 			adoptCodexHookEntry(entry, cmd, event)
+			// An install from before #5126 wrote 10 here, which codex clamps
+			// with a warning on every start. A lower value the reader set
+			// stays.
+			if event == "SessionEnd" {
+				capHookTimeout(entry, cmd, codexSessionEndCap)
+			}
 			// The matcher is part of the wiring, not a user setting, so an
 			// upgrade has to rewrite it: the SessionStart entry written when
 			// this meant "startup|resume" went on missing every compaction
@@ -146,7 +165,7 @@ func updateCodexHook(root map[string]any, event, cmd, matcher string, uninstall 
 		kept = append(kept, entryAny)
 	}
 	if !uninstall && !found {
-		h := map[string]any{"type": "command", "command": cmd, "timeout": 10}
+		h := map[string]any{"type": "command", "command": cmd, "timeout": codexHookTimeout(event)}
 		// Codex surfaces statusMessage in its hook run summary.
 		if msg := hookStatusMessage(event); msg != "" {
 			h["statusMessage"] = msg
@@ -176,6 +195,21 @@ func adoptHookTimeout(entry map[string]any, cmd string, timeout int) {
 			continue
 		}
 		h["timeout"] = timeout
+	}
+}
+
+// capHookTimeout lowers the timeout on the hook deja owns inside an entry to
+// limit when it asks for more, or says nothing at all.
+func capHookTimeout(entry map[string]any, cmd string, limit int) {
+	hs, _ := entry["hooks"].([]any)
+	for _, hAny := range hs {
+		h, _ := hAny.(map[string]any)
+		if h == nil || h["type"] != "command" || hookCommandKindOf(h["command"], cmd) != hookDejas {
+			continue
+		}
+		if t, ok := h["timeout"].(float64); !ok || t > float64(limit) {
+			h["timeout"] = limit
+		}
 	}
 }
 
@@ -335,7 +369,7 @@ export default {
     // ran here and a finished session stayed out of the next one's MCP recall
     // for twenty minutes (#4571).
     const live = new Set()
-    const endSession = (id) => runHook("hook-session-end", JSON.stringify({ session_id: id }), cwd)
+    const endSession = (id) => runHook("hook-session-end", JSON.stringify({ session_id: id, cwd }), cwd)
     // A sub-agent's session names its parent. Without it the sub-agent's
     // digest and recall led with the parent, which is live and is the very
     // session that spawned it (#4548, fixed for 1.x). 2.x hands the plugin
@@ -670,7 +704,7 @@ func legacyPluginJSFor(target, exe string) string {
   // ended, so without ending them here the stamp sat out its whole window and
   // the next session's MCP recall left a finished one out (#4546).
   const live = new Set()
-  const endSession = (id) => $%secho ${JSON.stringify({ session_id: id })} | %q hook-session-end%s.quiet()
+  const endSession = (id) => $%secho ${JSON.stringify({ session_id: id, cwd })} | %q hook-session-end%s.quiet()
   // The per-prompt recall each user message was given, by message.
   const recalled = new Map()
   const remember = (key, extra) => {
@@ -1181,51 +1215,238 @@ const kimiHookMarker = "# deja: auto-recall (managed by `deja install kimi-auto`
 // Several UserPromptSubmit hooks are allowed: kimi runs them all and joins
 // their output, each in its own <hook_result> block.
 func installKimiAuto(exe string, uninstall bool) (installResult, error) {
-	exe = hookExeFor(exe, uninstall)
 	path := filepath.Join(sources.KimiConfigDir(), "config.toml")
-	old, err := readConfig(path)
+	old, next, err := kimiHooksUpdate(path, hookExeFor(exe, uninstall), uninstall)
 	if err != nil {
 		return installResult{}, err
 	}
+	a, err := writeIfChanged(path, old, next)
+	return installResult{Path: path, Action: a}, err
+}
+
+// kimiHooksUpdate is installKimiAuto without the write.
+func kimiHooksUpdate(path, exe string, uninstall bool) (old, next []byte, err error) {
+	old, err = readConfig(path)
+	if err != nil {
+		return nil, nil, err
+	}
 	if !uninstall {
 		if err := tomlInlineKey(lfText(old), "[[hooks]]"); err != nil {
-			return installResult{}, configParseError(path, err)
+			return nil, nil, configParseError(path, err)
 		}
 	}
-	s := strings.TrimRight(removeKimiHookBlock(lfText(old)), "\n")
+	s := strings.TrimRight(removeKimiHookBlock(removeUnmarkedKimiDejaHooks(lfText(old), exe)), "\n")
 	if !uninstall {
-		block := kimiHookEntry("UserPromptSubmit", hookRun(exe, "hook-context", "--plain", "--once")) +
-			"\n" + kimiHookEntry("UserPromptSubmit", hookRun(exe, "hook-prompt", "--plain")) +
-			// Compaction throws away what the session was shown, and the list
-			// that stops those blocks repeating has to go with it. Kimi waits
-			// for this hook before it compacts, so the session is read here
-			// from wire.jsonl and its packet rides the next prompt. The payload
-			// names only the session, hence --harness.
-			"\n" + kimiHookEntry("PreCompact", hookRun(exe, "hook-precompact", "--harness", "kimi")) +
-			// The session is over, so its live stamp goes: the next session's
-			// MCP recall can answer with it now rather than in twenty minutes.
-			"\n" + kimiHookEntry("SessionEnd", hookRun(exe, "hook-session-end")) +
-			// A failed command's fix pair: Kimi fires these and drops what
-			// they print, so the pair waits for the session's next prompt
-			// (hook_deferred.go). The payload is snake_case with the shell
-			// tool named Bash and the failure under `error` (0.28.1
-			// toHookInputData, notifyPostToolUse).
-			"\n" + kimiHookEntryMatching("PostToolUse", "Bash", hookRun(exe, "hook-tool-after", "--defer")) +
-			"\n" + kimiHookEntryMatching("PostToolUseFailure", "Bash", hookRun(exe, "hook-tool-after", "--defer")) +
-			// The line about a file before Kimi edits it: runPreToolUse
-			// keeps only a block's reason, so the line waits for the next
-			// prompt too, with the edit made by then. The matcher is a
-			// regex tested unanchored, hence the anchors.
-			"\n" + kimiHookEntryMatching("PreToolUse", "^(Edit|Write)$", hookRun(exe, "hook-tool", "--defer"))
+		var block []string
+		for _, h := range kimiHooks {
+			c := hookRun(exe, h.args...)
+			if h.matcher == "" {
+				block = append(block, kimiHookEntry(h.event, c))
+			} else {
+				block = append(block, kimiHookEntryMatching(h.event, h.matcher, c))
+			}
+		}
 		if s != "" {
 			s += "\n\n"
 		}
-		s += block
+		s += strings.Join(block, "\n")
 	} else if s != "" {
 		s += "\n"
 	}
-	a, err := writeIfChanged(path, old, []byte(s))
-	return installResult{Path: path, Action: a}, err
+	return old, []byte(s), nil
+}
+
+// kimiHooks is what kimi-auto wires into config.toml.
+//
+// The digest and the per-prompt block both ride UserPromptSubmit.
+// Compaction throws away what the session was shown, and the list that stops
+// those blocks repeating has to go with it. Kimi waits for PreCompact before
+// it compacts, so the session is read there from wire.jsonl and its packet
+// rides the next prompt. The payload names only the session, hence --harness.
+// SessionEnd: the session is over, so its live stamp goes, and the next
+// session's MCP recall can answer with it now rather than in twenty minutes.
+// Kimi Code 2.2 fires it only when a session is closed, and `kimi -p` exits
+// without closing one, so a finished print run stayed hidden for the whole
+// window (#5145). Stop ends every turn, print mode's last one included, so it
+// clears the stamp too; the next turn's UserPromptSubmit stamps again. A turn
+// that opens without a prompt — a background task's notice — or one a
+// sub-agent's Stop cleared mid-way is stamped again by PreToolUse just before
+// it calls deja's MCP tool, so recall still leaves the asking session out.
+// A failed command's fix pair: Kimi fires PostToolUse(Failure) and drops what
+// they print, so the pair waits for the session's next prompt
+// (hook_deferred.go). The payload is snake_case with the shell tool named
+// Bash and the failure under `error` (0.28.1 toHookInputData,
+// notifyPostToolUse). The line about a file before Kimi edits it:
+// runPreToolUse keeps only a block's reason, so the line waits for the next
+// prompt too, with the edit made by then. The matcher is a regex tested
+// unanchored, hence the anchors.
+var kimiHooks = []struct {
+	event, matcher string
+	args           []string
+}{
+	{"UserPromptSubmit", "", []string{"hook-context", "--plain", "--once"}},
+	{"UserPromptSubmit", "", []string{"hook-prompt", "--plain"}},
+	{"PreCompact", "", []string{"hook-precompact", "--harness", "kimi"}},
+	{"SessionEnd", "", []string{"hook-session-end"}},
+	{"Stop", "", []string{"hook-session-end"}},
+	{"PreToolUse", "^mcp__deja__", []string{"hook-mcp-call"}},
+	{"PostToolUse", "Bash", []string{"hook-tool-after", "--defer"}},
+	{"PostToolUseFailure", "Bash", []string{"hook-tool-after", "--defer"}},
+	{"PreToolUse", "^(Edit|Write)$", []string{"hook-tool", "--defer"}},
+}
+
+// removeUnmarkedKimiDejaHooks drops a [[hooks]] table without deja's marker
+// that is exactly one deja writes: the same event and matcher, deja's own hook
+// line from any path, timeout 30, nothing else. Kimi Code's login and logout
+// write config.toml back from its parsed form, which keeps the tables and
+// drops every comment, the markers with them. Keyed on the marker alone,
+// uninstall then left every hook running a deja-hook it had deleted, and
+// install added a second set beside them. A rule the reader wrote around deja's
+// hook differs in one of those and stays.
+func removeUnmarkedKimiDejaHooks(s, exe string) string {
+	lines := strings.Split(s, "\n")
+	code := tomlCodeLines(s)
+	var out []string
+	for i := 0; i < len(lines); {
+		if strings.TrimSpace(tomlCode(code[i])) != "[[hooks]]" || i > 0 && strings.TrimSpace(lines[i-1]) == kimiHookMarker {
+			out = append(out, lines[i])
+			i++
+			continue
+		}
+		// The table ends at the next header or comment, as deja's marked block
+		// does: a note the reader wrote above their next hook is theirs.
+		end := i + 1
+		for end < len(lines) {
+			t := strings.TrimSpace(code[end])
+			if strings.HasPrefix(t, "[") || strings.HasPrefix(t, "#") {
+				break
+			}
+			end++
+		}
+		if !kimiTableIsDejas(code[i+1:end], exe) {
+			out = append(out, lines[i:end]...)
+			i = end
+			continue
+		}
+		// The table and the blank lines after it; a comment the reader wrote
+		// above the next hook stays.
+		for end < len(lines) && strings.TrimSpace(lines[end]) == "" {
+			end++
+		}
+		i = end
+	}
+	return strings.Join(out, "\n")
+}
+
+// kimiLegacyHooks are lines an older kimi-auto wrote: PreCompact ran
+// without --harness before #4793.
+var kimiLegacyHooks = []struct {
+	event, matcher string
+	args           []string
+}{
+	{"PreCompact", "", []string{"hook-precompact"}},
+}
+
+func kimiTableIsDejas(body []string, exe string) bool {
+	keys := map[string]string{}
+	for _, line := range body {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		k, v, ok := tomlLineKeyValue(line)
+		// An inline comment is the reader's, and the table with it.
+		if !ok || strings.TrimSpace(tomlCode(line)) != strings.TrimSpace(line) {
+			return false
+		}
+		if u, err := strconv.Unquote(v); err == nil {
+			v = u
+		} else if len(v) >= 2 && v[0] == '\'' && v[len(v)-1] == '\'' {
+			v = v[1 : len(v)-1]
+		}
+		keys[k] = v
+	}
+	if keys["timeout"] != "30" {
+		return false
+	}
+	for _, h := range append(kimiHooks, kimiLegacyHooks...) {
+		want := 3
+		if h.matcher != "" {
+			want = 4
+		}
+		if len(keys) == want && keys["event"] == h.event && keys["matcher"] == h.matcher &&
+			hookCommandKindOf(keys["command"], hookRun(exe, h.args...)) == hookDejas {
+			return true
+		}
+	}
+	return false
+}
+
+// installKimiMCP writes mcp.json. Kimi Code 2.2 reads only `enabled` on the
+// entry, so a "disabled": true kept from the reader is not called off.
+func installKimiMCP(exe string, uninstall bool) (installResult, error) {
+	path := filepath.Join(sources.KimiConfigDir(), "mcp.json")
+	res, err := installMCPJSON(path, exe, uninstall)
+	if err == nil && !uninstall && !dejaEntrySwitchedOff("kimi", path) {
+		res.Note = dropNotePart(res.Note, switchedOffNote)
+	}
+	return res, err
+}
+
+// kimiAutoPreflight runs the refusals of kimi-auto's config.toml and tui.toml
+// halves before mcp.json is written: a read-only one was refused after the
+// files before it had been written, and the target was left half wired.
+func kimiAutoPreflight(exe string, uninstall bool) error {
+	// The launcher path the writers will name, without writing it yet; they
+	// fall back to the binary when the launcher cannot be written, so a file
+	// that needs no change under either is not refused.
+	exes := []string{exe}
+	if p := dejaLauncherPath(); p != "" && !uninstall {
+		exes = []string{p, exe}
+	}
+	path := filepath.Join(sources.KimiConfigDir(), "config.toml")
+	var refusal error
+	for _, e := range exes {
+		old, next, err := kimiHooksUpdate(path, e, uninstall)
+		if err != nil {
+			return err
+		}
+		if refusal = writableIfChanged(path, old, next); refusal == nil {
+			break
+		}
+	}
+	if refusal != nil {
+		return refusal
+	}
+	// Not on the way out: uninstall runs the plain kimi target too, which
+	// removes mcp.json whatever this says.
+	if uninstall {
+		return nil
+	}
+	tui := filepath.Join(sources.KimiConfigDir(), "tui.toml")
+	for _, e := range exes {
+		cmd := hookRun(e, "statusline")
+		old, next, _, err := tomlStatuslineUpdate(tui, "status_line", kimiStatuslineBlock(cmd), cmd, false)
+		if err != nil {
+			return err
+		}
+		if next == nil {
+			return nil
+		}
+		if refusal = writableIfChanged(tui, old, next); refusal == nil {
+			return nil
+		}
+	}
+	return refusal
+}
+
+// writableIfChanged is the read-only refusal writeIfChanged would give, asked
+// before anything is written.
+func writableIfChanged(path string, old, next []byte) error {
+	next = matchFinalNewline(old, matchLineEndings(old, next))
+	if bytes.Equal(old, next) {
+		return nil
+	}
+	return configWritable(path)
 }
 
 // kimiHookEntry is one marked block. Every block carries the marker, so

@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -192,12 +194,44 @@ func installTUIPluginList(dir, schema, entry string, uninstall bool) (installRes
 		return installResult{}, err
 	}
 	root := map[string]any{}
+	// opencode reads tui.json as JSONC: 1.18.35 applies one with a comment
+	// and a trailing comma. Decoded as strict JSON, that file failed the whole
+	// opencode-auto target, install and uninstall alike.
+	commented := configIsJSONC(old)
 	if len(bytes.TrimSpace(old)) > 0 {
-		if err := json.Unmarshal(old, &root); err != nil {
+		text := old
+		if commented {
+			text = []byte(jsoncToJSON(lfText(old)))
+		}
+		if err := json.Unmarshal(text, &root); err != nil {
 			return installResult{}, configParseError(path, err)
 		}
 	}
 	raw, _ := root["plugin"].([]any)
+	listed := slices.Contains(raw, any(entry))
+	if uninstall && !listed {
+		return installResult{Path: path, Action: "unchanged"}, nil
+	}
+	if commented && uninstall {
+		// deja's element comes out as text, so the reader's comments and
+		// entries stay. Left as a note, a reader who followed install's note
+		// kept a list entry naming the file uninstall had just deleted (#5313).
+		next, err := cutTUIPluginEntry(lfText(old), entry)
+		if err != nil {
+			return installResult{}, configParseError(path, err)
+		}
+		a, err := writeIfChanged(path, old, []byte(next))
+		return installResult{Path: path, Action: a}, err
+	}
+	if commented {
+		// Writing the decoded object back would drop the reader's comments, so
+		// the list is theirs to edit, the way a tui.jsonc is.
+		r := installResult{Path: path, Action: "unchanged"}
+		if !listed {
+			r.Note = "add " + strconv.Quote(entry) + " to its plugin list to show deja's status line"
+		}
+		return r, nil
+	}
 	var list []any
 	for _, p := range raw {
 		if s, _ := p.(string); s != entry {
@@ -212,16 +246,23 @@ func installTUIPluginList(dir, schema, entry string, uninstall bool) (installRes
 	} else {
 		root["plugin"] = list
 	}
-	if uninstall && len(root) == 0 || uninstall && len(root) == 1 && root["$schema"] == schema {
-		// Nothing but what deja wrote: the file goes with the entry.
-		if len(old) > 0 && !slices.Contains(raw, any(entry)) {
-			return installResult{Path: path, Action: "unchanged"}, nil
+	if uninstall && (len(root) == 0 || len(root) == 1 && root["$schema"] == schema) {
+		// Nothing but what deja wrote: the file goes with the entry, when
+		// deja is what created it. One the reader had — empty, `{}`, an empty
+		// list, opencode's own $schema line — was deleted with it; it goes
+		// through writeIfChanged instead, which hands back deja's snapshot
+		// where only empty blocks differ from it and keeps an empty file empty.
+		if wiringCreated(path) {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return installResult{}, err
+			}
+			pruneCreatedDir(dir)
+			return installResult{Path: path, Action: "removed"}, nil
 		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return installResult{}, err
+		if b, ok := ownSnapshot(path); ok && len(bytes.TrimSpace(b)) == 0 {
+			a, err := writeIfChanged(path, old, nil)
+			return installResult{Path: path, Action: a}, err
 		}
-		pruneCreatedDir(dir)
-		return installResult{Path: path, Action: "removed"}, nil
 	}
 	if _, ok := root["$schema"]; !ok && len(bytes.TrimSpace(old)) == 0 {
 		root["$schema"] = schema
@@ -233,6 +274,38 @@ func installTUIPluginList(dir, schema, entry string, uninstall bool) (installRes
 	next = append(next, '\n')
 	a, err := writeIfChanged(path, old, next)
 	return installResult{Path: path, Action: a}, err
+}
+
+// cutTUIPluginEntry takes entry out of the top-level plugin list of a
+// commented tui.json, and the plugin key with it when entry was all the list
+// held.
+func cutTUIPluginEntry(text, entry string) (string, error) {
+	open := zedTopLevelOpen(text)
+	if open < 0 {
+		return "", errors.New("does not look like a settings object")
+	}
+	end := zedObjectEnd(text, open)
+	if end < 0 {
+		return "", errors.New("does not look like a settings object")
+	}
+	at := jsoncListValue(text, &zedSpan{keyStart: open, valueOpen: open, valueEnd: end}, "plugin")
+	if at == nil {
+		return "", errors.New("plugin is not where it parsed")
+	}
+	next, err := jsoncCutListStrings(text, *at, func(s string) bool { return s == entry })
+	if err != nil {
+		return "", fmt.Errorf("plugin %w", err)
+	}
+	var root struct {
+		Plugin []any `json:"plugin"`
+	}
+	if err := json.Unmarshal([]byte(jsoncToJSON(next)), &root); err != nil {
+		return "", err
+	}
+	if len(root.Plugin) == 0 {
+		return jsoncRemoveKey(text, "", "plugin", 0)
+	}
+	return next, nil
 }
 
 // installOpencodeTUI puts deja's status line in opencode's TUI: the plugin

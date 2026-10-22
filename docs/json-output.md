@@ -57,6 +57,11 @@ from a list of hits:
   all 20 answers labelled `relevance` had a strict head of 1 to 9 sessions,
   and none of them had matched nothing.
 - `total` and `capped` — how many sessions matched, and whether a cap hid some.
+- `total_estimated` — `total` counts the sessions a paged search did not read
+  by an estimate rather than by checking each against the text. Set when the
+  text check turned down sessions the words' postings named, most often a
+  quoted phrase over common words, and the unread ones were too many to check;
+  omitted otherwise.
 - `policy_withheld` — how many matching sessions this machine's trust policy
   kept out of the answer. Omitted when none were. Present on `search --json`,
   `last --json` and `stats --json`, so an empty result can be told apart from a
@@ -151,6 +156,12 @@ sentence saying how many of the files the session touched have commits since
 it ended; only the first three hits are checked, and `DEJA_MOVED=0` turns it
 off. `lifecycle`, `lifecycle_note` and `lifecycle_at` (optional) on the hit
 carry the state of a promoted decision, as they do on a `blame` row.
+
+`hits` come in ranked order, `--all` included. `--sort date` puts them newest
+`updated` first, and on the `exact`, `close` and `stemmed` tiers the page is
+the newest of the whole match. The `relevance` and `error` tiers rank a window
+of at most 50 sessions first, so there it is the newest of that window, and on
+`relevance` the hits with `strict` set come before the rest.
 
 ### What a hit's `messages` are
 
@@ -589,9 +600,11 @@ directory) doctor runs in. For Reasonix, `switched_off` means deja's plugin pack
 record in `plugin-packages.json`, which is what `reasonix plugin disable deja`
 leaves. The `deepseek` row carries `plugin_missing` when
 `cordis.patch.yml` names a deja plugin file dsh cannot find, which keeps dsh
-from starting at all. The `pi` row is `no-adapter`, with the fix in `note`,
-when `mcp.json` declares deja and pi's packages do not include
-pi-mcp-adapter, the only thing in pi that reads that file.
+from starting at all. The `pi` row is `no-adapter`, with the reason in `note`,
+when `mcp.json` declares deja and nothing in pi reads that file: a pi before
+0.99 without pi-mcp-adapter in its packages, or a newer one whose built-in
+`mcp` extension is switched off in `extensions` (the state keeps its name;
+`note` says which).
 The `workbuddy` row is `untrusted`, with the fix in `note`, when WorkBuddy AI's
 `mcp-approvals.json` has no approval for deja's entry as written.
 `cherrystudio` is read from the app's own database: `wired`

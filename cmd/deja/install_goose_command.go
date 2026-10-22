@@ -170,20 +170,37 @@ func installGooseCommand(exe string, uninstall bool) (installResult, error) {
 		return installResult{}, err
 	}
 	recipe := gooseRecipePath()
-	if !uninstall {
+	// Written only once the config has been accepted, so a refused command leaves
+	// nothing behind: the recipe used to go first and stayed on disk with no entry
+	// pointing at it until an uninstall (#5296). The "unchanged" returns below
+	// still call it, since the recipe is refreshed even when the entry is there.
+	writeRecipe := func() error {
 		noteCreatedDirs(filepath.Dir(recipe))
 		if err := os.MkdirAll(filepath.Dir(recipe), 0o755); err != nil {
-			return installResult{}, err
+			return err
 		}
 		oldRecipe, err := readConfig(recipe)
 		if err != nil {
-			return installResult{}, err
+			return err
 		}
-		if _, err := writeIfChanged(recipe, oldRecipe, []byte(gooseRecipe(exe))); err != nil {
-			return installResult{}, err
-		}
+		_, err = writeIfChanged(recipe, oldRecipe, []byte(gooseRecipe(exe)))
+		return err
 	}
 
+	if !uninstall {
+		// Read by value: goose saves this file through serde_yaml, unquoted,
+		// and a match on deja's own text rewrote the entry and moved the key
+		// to the bottom after every save of goose's (#5193).
+		if _, err := yamlTopKeyEnd(normaliseGooseNewlines(string(old))+"\n", "slash_commands:"); err != nil {
+			return installResult{}, fmt.Errorf("%s: %w", path, err)
+		}
+		if _, ours := gooseSlashCommandOurs(normaliseGooseNewlines(string(old)), recipe); ours {
+			if err := writeRecipe(); err != nil {
+				return installResult{}, err
+			}
+			return installResult{Path: path, Action: "unchanged"}, nil
+		}
+	}
 	next := removeGooseSlashCommand(normaliseGooseNewlines(string(old)))
 	if !uninstall {
 		// At the indent the list already uses, the way the extensions writer
@@ -198,6 +215,9 @@ func installGooseCommand(exe string, uninstall bool) (installResult, error) {
 		// block to the bottom. See the same guard in installGoose — the two
 		// writers were swapping their keys round on every install (#3689).
 		if strings.Contains(normaliseGooseNewlines(string(old)), entry) {
+			if err := writeRecipe(); err != nil {
+				return installResult{}, err
+			}
 			return installResult{Path: path, Action: "unchanged"}, nil
 		}
 		if next != "" && !strings.HasSuffix(next, "\n") {
@@ -218,6 +238,11 @@ func installGooseCommand(exe string, uninstall bool) (installResult, error) {
 			next = next[:at] + entry + next[at:]
 		} else {
 			next += "slash_commands:\n" + entry
+		}
+	}
+	if !uninstall {
+		if err := writeRecipe(); err != nil {
+			return installResult{}, err
 		}
 	}
 	noteCreatedDirs(filepath.Dir(path))

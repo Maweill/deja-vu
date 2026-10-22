@@ -121,8 +121,8 @@ func LoadClaude() []model.Session {
 		for _, s := range ss {
 			seen[s.ID] = true
 		}
-		h, _ := ParseClaudeHistory(hist)
-		for _, s := range h {
+		h, err := ParseClaudeHistory(hist)
+		for _, s := range storeRead(hist, h, err) {
 			if !seen[s.ID] {
 				ss = append(ss, s)
 			}
@@ -209,7 +209,7 @@ func ClaudeFileWanted(p string) bool {
 	if !strings.HasSuffix(p, ".jsonl") {
 		return false
 	}
-	if os.Getenv("DEJA_INCLUDE_SUBAGENTS") == "0" {
+	if SubagentsOff() {
 		return !IsSubagentPath(p)
 	}
 	return true
@@ -217,8 +217,8 @@ func ClaudeFileWanted(p string) bool {
 
 // IsSubagentPath reports whether a transcript is a child run, by where it sits.
 // The file's own isSidechain flag says the same thing for the files that carry
-// it, and a sidechain transcript outside such a directory is a full session as
-// far as this rule is concerned — the same reading the count in #3009 used.
+// it. A sidechain transcript outside such a directory is listed whatever the
+// switch says, and the registry's switch cuts or drops it by its kind (#5301).
 func IsSubagentPath(p string) bool {
 	return strings.Contains(p, string(filepath.Separator)+"subagents"+string(filepath.Separator))
 }
@@ -296,8 +296,12 @@ func parseClaudeGenericFromOffset(path string, offset int64) ([]model.Session, e
 	// Where each Bash call's record landed, so the result that arrives in a
 	// later record can stamp its outcome onto it.
 	commandAt := map[string][]int{}
+	forkedFrom := ""
 	err := scanJSONLFromOffset(path, offset, func(m map[string]any) {
 		typ, _ := m["type"].(string)
+		if ff, ok := m["forkedFrom"].(map[string]any); ok && forkedFrom == "" {
+			forkedFrom, _ = ff["sessionId"].(string)
+		}
 		if typ != "user" && typ != "assistant" {
 			return
 		}
@@ -334,6 +338,9 @@ func parseClaudeGenericFromOffset(path string, offset int64) ([]model.Session, e
 		}
 		if summary, _ := m["isCompactSummary"].(bool); summary && typ == "user" && role == "user" {
 			role = RoleSummary
+		}
+		if role == "user" {
+			txt = UnwrapPastedContent(txt)
 		}
 		if txt != "" {
 			s.Messages = append(s.Messages, model.Message{Role: role, Text: txt, Time: t})
@@ -379,9 +386,10 @@ func parseClaudeGenericFromOffset(path string, offset int64) ([]model.Session, e
 	if len(s.Messages) == 0 {
 		return nil, err
 	}
+	markClaudeBranch(&s, forkedFrom)
 	// The same cut the typed parser makes: this is the reference it is proved
 	// against, and a difference here reads as a parser bug (#3009).
-	if IsSubagentPath(path) && os.Getenv("DEJA_INCLUDE_SUBAGENTS") != "1" {
+	if IsSubagentPath(path) && !SubagentsWhole() {
 		s.Messages = KeepSubagentTail(s.Messages)
 	}
 	if p := projectFromPaths(s.Messages); p != "" {

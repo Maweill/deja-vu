@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -99,8 +100,8 @@ func kiroUnderSessDir(p string) bool {
 func LoadKiro() []model.Session {
 	ss := parseFiles(KiroCLIFiles(), ParseKiroCLIFile)
 	ss = append(ss, parseFiles(KiroIDEFiles(), ParseKiroIDEFile)...)
-	dbSS, _ := ParseKiroDB(KiroDB())
-	return append(ss, dbSS...)
+	dbSS, err := ParseKiroDB(KiroDB())
+	return append(ss, dbRead(KiroDB(), dbSS, err)...)
 }
 
 // ParseKiroCLIFile reads one CLI transcript.
@@ -227,12 +228,11 @@ func KiroCLIResumes(path string, offset int64) bool {
 	})
 }
 
-// kiroExitResumes is the #4443 rule for kiro-cli: a clean result left in the
-// next pass is let go, as it is for pi, and a failed one is not.
-var kiroExitResumes = resumesUnlessAnswering(`"toolUseId"`, func(m map[string]any) ([]string, string) {
+// kiroExitResumes is the #4443 rule for kiro-cli, whose reader stamps the
+// exit_status of a clean run too.
+var kiroExitResumes = resumesUnlessSettling(`"toolUseId"`, func(m map[string]any) (calls, failed, clean []string) {
 	data, _ := m["data"].(map[string]any)
 	parts, _ := data["content"].([]any)
-	var calls []string
 	for _, part := range parts {
 		p, _ := part.(map[string]any)
 		d, _ := p["data"].(map[string]any)
@@ -242,11 +242,21 @@ var kiroExitResumes = resumesUnlessAnswering(`"toolUseId"`, func(m map[string]an
 			calls = append(calls, id)
 		case "toolResult":
 			if code, ok := kiroExitStatus(d["content"]); ok && code != 0 {
-				return calls, id
+				failed = append(failed, id)
+			} else if ok {
+				clean = append(clean, id)
 			}
 		}
 	}
-	return calls, ""
+	return calls, failed, clean
+}, func(line []byte) []string {
+	data, _ := decodeJSONLine(line)["data"].(map[string]any)
+	_, calls, _ := kiroContent(data["content"])
+	var ids []string
+	for _, c := range commandCallsIn(calls, kiroDialect) {
+		ids = append(ids, c.ID)
+	}
+	return ids
 })
 
 // applyKiroCLIHeader reads identity out of the header file beside the
@@ -256,10 +266,7 @@ func applyKiroCLIHeader(s *model.Session, path string) {
 	if err != nil {
 		return
 	}
-	var header struct {
-		SessionID string `json:"session_id"`
-		CWD       string `json:"cwd"`
-	}
+	var header kiroCLIHeader
 	if json.Unmarshal(b, &header) != nil {
 		return
 	}
@@ -269,6 +276,46 @@ func applyKiroCLIHeader(s *model.Session, path string) {
 	if header.CWD != "" {
 		s.Project = projectName(header.CWD)
 	}
+	header.applyParent(s)
+}
+
+type kiroCLIHeader struct {
+	SessionID string `json:"session_id"`
+	CWD       string `json:"cwd"`
+	// Set on the session a sub-agent runs in (the subagent tool, 2.32): the
+	// session that spawned it. session_created_reason says "subagent" on
+	// top-level sessions too, so it is not read.
+	ParentSessionID string `json:"parent_session_id"`
+}
+
+func (h kiroCLIHeader) applyParent(s *model.Session) {
+	if p := strings.TrimSpace(h.ParentSessionID); p != "" && p != s.ID {
+		s.Kind = "subagent"
+		s.Parent = p
+	}
+}
+
+var kiroSessionID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// KiroSessionHead is what a kiro-cli session's header says about a session
+// the index has not seen yet. A sub-agent's hooks name only its own session
+// and fire before any build, so its digest led with the parent that spawned
+// it. Who it is, not its messages; false unless the header names a parent.
+func KiroSessionHead(id string) (model.Session, bool) {
+	if !kiroSessionID.MatchString(id) {
+		return model.Session{}, false
+	}
+	b, err := os.ReadFile(filepath.Join(KiroRoot(), "cli", id+".json"))
+	if err != nil {
+		return model.Session{}, false
+	}
+	var header kiroCLIHeader
+	if json.Unmarshal(b, &header) != nil {
+		return model.Session{}, false
+	}
+	s := model.Session{ID: id, Harness: "kiro"}
+	header.applyParent(&s)
+	return s, s.Parent != ""
 }
 
 // KiroSessionDir is the directory a Kiro session ran in, from the metadata

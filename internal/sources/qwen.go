@@ -2,7 +2,6 @@ package sources
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -16,8 +15,12 @@ func QwenConfigDir() string { return filepath.Join(Home(), ".qwen") }
 
 func QwenRoot() string { return EnvPath("DEJA_QWEN_ROOT", QwenConfigDir()) }
 
+// QwenSessionFiles takes sub-agent logs by default, read the way Claude's are:
+// the task, the last turns and the files the child changed, so blame can name
+// the sub-agent that wrote a file (#5223). DEJA_INCLUDE_SUBAGENTS=1 keeps the
+// whole run and =0 skips them.
 func QwenSessionFiles() []string {
-	subagents := os.Getenv("DEJA_INCLUDE_SUBAGENTS") == "1"
+	subagents := !SubagentsOff()
 	return walkFiles(filepath.Join(QwenRoot(), "projects"), func(p string) bool {
 		return strings.HasSuffix(p, ".jsonl") && filepath.Base(filepath.Dir(p)) == "chats" ||
 			subagents && QwenSubagentFile(p)
@@ -52,8 +55,8 @@ func QwenSidecarFiles() []string {
 }
 
 // QwenSubagentFile reports whether p is a sub-agent's log,
-// projects/<project>/subagents/<session>/agent-<id>.jsonl. The reader takes
-// only chats/ unless DEJA_INCLUDE_SUBAGENTS=1 (#4483), so doctor counts these
+// projects/<project>/subagents/<session>/agent-<id>.jsonl. With
+// DEJA_INCLUDE_SUBAGENTS=0 the reader leaves them out, and doctor counts them
 // as skipped, not unread (#4475).
 func QwenSubagentFile(p string) bool {
 	return strings.HasSuffix(p, ".jsonl") && qwenUnder(p, "subagents")
@@ -130,6 +133,12 @@ func ParseQwenFileFromOffset(path string, offset int64) ([]model.Session, error)
 }
 
 func parseQwenFileFromOffset(path string, offset int64) ([]model.Session, error) {
+	return parseQwenScan(path, func(fn func(map[string]any)) error { return scanJSONLFromOffset(path, offset, fn) })
+}
+
+// parseQwenScan reads the records scan hands over as the Qwen transcript at
+// path: the whole file, a tail from an offset, or a hook's bounded head.
+func parseQwenScan(path string, scan func(func(map[string]any)) error) ([]model.Session, error) {
 	project := cwdProjectName(qwenTranscriptCWD(path))
 	if project == "" {
 		project = claudeProjectName(projectDir(filepath.Join(QwenRoot(), "projects"), path))
@@ -154,8 +163,16 @@ func parseQwenFileFromOffset(path string, offset int64) ([]model.Session, error)
 	// A shell call and its result are separate records; the call id carries
 	// the command over to the result its exit status is read from (#4255).
 	shellAt := map[string]int{}
-	err := scanJSONLFromOffset(path, offset, func(m map[string]any) {
+	// A /branch copies its source's records and marks each with
+	// forkedFrom.sessionId, the session it was copied out of (0.20.0
+	// SessionService.forkSession). That is the fork's source, said by the
+	// harness, so the branch's own recall can leave it out.
+	forkedFrom := ""
+	err := scan(func(m map[string]any) {
 		typ, _ := m["type"].(string)
+		if ff, ok := m["forkedFrom"].(map[string]any); ok && forkedFrom == "" {
+			forkedFrom, _ = ff["sessionId"].(string)
+		}
 		if typ == "tool_result" {
 			// Every tool result is its own record, role user, parts holding
 			// the functionResponse. Skipped with the other types, a failing
@@ -185,6 +202,11 @@ func parseQwenFileFromOffset(path string, offset int64) ([]model.Session, error)
 		}
 		if id, _ := m["sessionId"].(string); id != "" && !child {
 			s.ID = id
+		}
+		// Every record of a sub-agent's log names the agent it ran as:
+		// general-purpose, a user agent, or "fork".
+		if name, _ := m["agentName"].(string); child && name != "" && s.Agent == "" {
+			s.Agent = name
 		}
 		t := parseTimeAny(m["timestamp"])
 		s.Touch(t)
@@ -216,8 +238,14 @@ func parseQwenFileFromOffset(path string, offset int64) ([]model.Session, error)
 			qwenNoteExits(&s, msg["parts"], shellAt)
 		}
 	})
+	if forkedFrom != "" && forkedFrom != s.ID && !child {
+		s.Kind, s.Parent = "fork", forkedFrom
+	}
 	if len(s.Messages) == 0 {
 		return nil, err
+	}
+	if child && !SubagentsWhole() {
+		s.Messages = KeepSubagentTail(s.Messages)
 	}
 	return []model.Session{s}, err
 }

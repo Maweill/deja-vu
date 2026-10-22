@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +41,38 @@ func OpenClawAgentDBs() []string {
 		}
 	}
 	return dbs
+}
+
+// OpenClawNewestSession is the OpenClaw session written to last, after since,
+// across the transcript files and the per-agent stores, and when. Read off
+// the stores rather than the index, which can be a pass behind the turn being
+// written (#5271).
+func OpenClawNewestSession(since time.Time) (string, time.Time) {
+	var id string
+	var at time.Time
+	for _, p := range OpenClawSessionFiles() {
+		fi, err := os.Stat(p)
+		if err != nil || !fi.ModTime().After(since) || !fi.ModTime().After(at) {
+			continue
+		}
+		id, at = strings.TrimSuffix(filepath.Base(p), ".jsonl"), fi.ModTime()
+	}
+	for _, db := range OpenClawAgentDBs() {
+		out, err := sqliteOutput(db, fmt.Sprintf("select cast(session_id as text) || char(9) || max(created_at) from transcript_events"+
+			" where created_at > %d group by session_id order by max(created_at) desc limit 1", since.UnixMilli()))
+		if err != nil {
+			continue
+		}
+		sid, ms, ok := strings.Cut(strings.TrimSpace(string(out)), "\t")
+		n, perr := strconv.ParseInt(ms, 10, 64)
+		if !ok || perr != nil || sid == "" {
+			continue
+		}
+		if t := time.UnixMilli(n); t.After(at) {
+			id, at = sid, t
+		}
+	}
+	return id, at
 }
 
 // OpenClawStoreFiles is every OpenClaw store deja reads: the legacy transcript
@@ -143,6 +176,7 @@ func parseOpenClawDBWhere(db, where string) ([]model.Session, error) {
 		}
 		openclawInflate(pending)
 		r := newPiReader(s, true)
+		r.openclaw = true
 		for _, row := range pending {
 			var m map[string]any
 			if err := json.Unmarshal([]byte(row.Event), &m); err != nil {
@@ -179,9 +213,12 @@ func parseOpenClawDBWhere(db, where string) ([]model.Session, error) {
 			// No stdout is a query that matched nothing or one sqlite3 refused
 			// to run; the second must not read as an empty store, or a whole
 			// harness vanishes from recall while doctor calls it healthy.
-			return nil, fmt.Errorf("openclaw: query failed, the store schema may have changed: %w", err)
+			return nil, schemaChanged("openclaw", err)
 		}
 		return nil, err
+	}
+	if len(out) > 0 {
+		applyOpenClawSpawns(out, openclawDBSpawns(db))
 	}
 	return out, nil
 }

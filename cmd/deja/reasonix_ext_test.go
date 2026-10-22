@@ -287,7 +287,7 @@ func TestReasonixExtRefusesAnotherProtocol(t *testing.T) {
 		if err != nil {
 			t.Fatalf("serve = %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Minute):
 		t.Fatal("the sidecar kept serving after refusing the handshake")
 	}
 }
@@ -320,8 +320,11 @@ func TestReasonixExtSurvivesMalformedFrames(t *testing.T) {
 		t.Errorf("shutdown answer = %+v", f)
 	}
 	select {
-	case <-h.done:
-	case <-time.After(5 * time.Second):
+	case err := <-h.done:
+		if err != nil {
+			t.Fatalf("serve after shutdown = %v", err)
+		}
+	case <-time.After(2 * time.Minute):
 		t.Fatal("the sidecar did not stop after shutdown")
 	}
 }

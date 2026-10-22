@@ -7,18 +7,461 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- A cold build keys messages without allocating a string per word, so the
+  indexing phase takes half the CPU. On a 12,000-session Codex store it drops
+  from 9.3 s to 4.2 s and the whole build from 273 to 215 CPU-seconds (#5567).
 ### Added
 
 - `~/.config/deja/projects` names a directory tree as one project, one `<path> = <name>` per line. Every checkout and worktree under a listed path is indexed under that name, and the hooks and recall standing anywhere in it scope to all of them. Sessions indexed before keep their old name until `deja index --rebuild`, and notes the name they were filed under.
+- `deja search --sort date` lists the newest match first, in the text and in
+  `--json`, and `^s` in the search screen turns the list newest first under
+  day headings and back. On a common word the page is the newest of the whole
+  match, not the newest of the best-ranked thousand (#5577).
+- A cold build reads each transcript line once instead of handing it to six
+  readers that each decoded it again, and checks tool output for known errors
+  in one pass per line. On 40,000 sessions it takes 60 s instead of 87 s and
+  353 CPU-seconds instead of 551 (#5586).
+
+### Fixed
+
+- An `apply_patch` that renames a file (`*** Move to:`) records its hunks
+  under the new name, so `deja blame` and `deja restore` find them there.
+  Codex, opencode, Copilot CLI, OpenClaw, pi, Cline, Roo and Amp filed them
+  under the old path (#595).
+- `deja blame` attributes lines written by CodeWhale's `write_file` and
+  `fim_edit` (the latter read from its result), and `deja blame` and
+  `deja restore` see the symbol a Crush `lsp_replace_symbol` replaced (from
+  the result's metadata) and the lines a Reasonix `delete_symbol` cut (from
+  the diff it returns). Each kept only the path, or only the written side
+  (#595).
+- `deja blame` attributes a line a Copilot agent wrote with
+  `insert_edit_into_file`. The transcript reader kept only the file's path
+  (#595).
+- A transcript with nothing to index, such as one tool result that was only a
+  `<deja-recall>` block, no longer gets an empty session in `deja last` from
+  an incremental pass. A rebuild never listed it (#5563).
+- The `deja_recall` tool in the dsh, opencode, OpenClaw and Hermes plugins
+  answers with the MCP recall page, about 4 KB, and takes an `offset` for the
+  next one. dsh and opencode handed the model `search --json`: 222,536
+  characters for five hits on a test store. `deja recall` takes `--offset`
+  (#5568).
+- The skills' shell fallback is `deja recall`, not `deja --framed search
+  --json`, which ran to 222,546 bytes for one query on the same store against
+  4,097 (#5578). The Devin plugin's copy of the skill had drifted and is
+  current again.
+- A recall page that names a session matched more often than it can quote
+  says to call recall with that id, not recall_context, which the OpenClaw and
+  Hermes plugins do not have. Recall opens any id recall_context would,
+  including a Devin subagent's (#5579).
+
+## [0.23.1] - 2026-10-22
+
+Big stores build and search for less. A cold build peaks at half the memory
+it did (4.7 GB instead of 9.4 GB on 40,000 sessions, 2.4 GB instead of 4.0 GB
+on a 12,000-session Codex store), redacts with 17x less CPU and writes a
+quarter of the scratch data. The slowest searches answer in under 200 ms in
+process instead of up to 800, and a search over many copies or look-alike
+sessions is no longer quadratic, a slowdown 0.23.0 made worse. A pass and a
+rebuild now agree on copies of one session in several projects. The index is
+rebuilt once on upgrade.
+
+### Changed
+
+- A question with a word the store never saw reads each word's postings once
+  when it tries the word's neighbours, instead of once per neighbour: on
+  19,195 sessions search p95 went from 420 to 170 ms and the slowest question
+  from 740 to 200 ms, with the same answers (#5540).
+- A cold build peaks at half the memory: 4.7 GB instead of 9.4 GB on a
+  40,000-session store. The message count and the rebuild's dedupe set key on
+  a hash instead of the text, and a full build runs the collector at GOGC=25
+  unless GOGC or GOMEMLIMIT is set (#5498).
+- Redacting secrets during a build takes 17x less CPU with the same output: on
+  a 12,000-session Codex store the cold build went from 109 s to 45 s wall and
+  904 s to 285 s of CPU (#5512).
+- A cold build derives each session's row on every core instead of in the
+  write loop: 189-202 s to 157-169 s on a 40,000-session store (#5524).
+- A cold build of a store under 20,000 sessions no longer holds every
+  session's words at once to count which words go together: a 12,000-session
+  Codex store peaks at 2.4 GB instead of 4.0 GB (#5533).
+- A cold build writes a quarter of the scratch data it did, so a busy disk
+  no longer stalls it: 2.47 GB to 0.59 GB on a 12,000-session Codex store, and
+  indexing messages took 15-20 s instead of 32-35 s with the disk under other
+  load (#5526).
+- `deja index` decodes the manifest and walks the stores once: renaming 20
+  transcripts on a 40,000-session store takes 0.97 s instead of 1.5 s (#5471).
+- A pass that also sees a database store change (opencode, grok and the like)
+  reads only the sessions that store changed: one new opencode message on a
+  40,000-session store goes from 2.4 s to 1.4 s (#5476).
+- The search screen reads a page at a time. A word most of a 40,000-session
+  store holds lists its first 80 cards in about 1 s instead of 16, the list is
+  headed with every match, and the next page loads as the selection nears the
+  end (#5487).
+- MCP `recall` runs one index search where it ran two: 2.4 s to 1.3 s outside
+  any known project, 2.2 s to 1.4 s inside one, same page (#5486).
+- A session the trust policy withholds no longer takes a slot in a large
+  search's pool or counts toward its total (#5488).
+
+### Fixed
+
+- `deja forget` on a session whose transcript was already deleted no longer
+  leaves that file counted as kept, which only a second rebuild cleared
+  (#5521).
+- A SQLite store read is given up only when it stops moving, not at ten
+  minutes on the clock: a Hermes store of 1,683 sessions still reading on a
+  slow disk was cut and left out of a first build. A store given up, or whose
+  read fails, is named (`hermes: skipped — no progress for 10m0s;
+  DEJA_STORE_TIMEOUT=0 waits`), `deja index` exits 3 and `deja doctor` lists
+  it, and a rebuild keeps what the last index held from it (#5517).
+- A word taken out of every transcript leaves `cooccur.gob` on the pass that
+  replaced it, not at the next full build (#5489).
+- The command tables of a session two transcripts share count the copy the
+  row names, in a pass and a full build alike, and a migrated goose session
+  counts each run once (#5490, #5491).
+- A paged `deja search`, MCP `recall` and `recall_context` check a quoted
+  phrase's unread matches against the text instead of counting the words'
+  postings: on a 40k-session store `"jolquihol huxdex"` said 9 of 4,109 and
+  now lists 15 of 28. Past 20,000 postings the count is an estimate and says
+  `about` (`total_estimated` in `--json`) (#5495).
+- Fixes and `frictext.bin` of a session two transcripts in two projects share
+  are read from the copy the row names, as the command tables are, so a pass
+  no longer pairs one file's error with the other's remedy and matches a
+  rebuild (#5504).
+- A transcript rewritten and moved to another project before the next pass
+  keeps the friction line and session facts a rebuild gives it: the rebuild
+  writes the old copy and the new one in the order the log held them (#5519).
+- A Claude command whose result lands one pass after its call carries the
+  `exit 0` its result reports, as after a rebuild, instead of no outcome
+  (#5527). So does a goose, kiro-cli or pi-family command (#5529).
+  (#5527).
+- A session whose deleted transcript owns its row keeps, after a rebuild,
+  the conclusion, friction lines and questions the pass read off that file,
+  not ones taken from its records in log order (#5535).
+- A line a live transcript repeats from a deleted copy of the same session
+  is counted once (#5544).
+- `deja index --quiet` no longer prints the shared-id line, which now counts
+  sessions rather than transcripts. Command "last run" dates read the same
+  after a pass and a rebuild, and a plain word some sessions hold only in a
+  command checks just those sessions instead of every unread match (#5504).
+- The Grok, Command Code, Kimi and Kiro line readers and tail checks stream
+  long JSONL lines through `readLineBytes` rather than holding them whole: a
+  16 MB line is read in memory bounded by the message cap instead of the
+  line (#5424).
+The search screen reads a page at a time. A word most of a 40,000-session store holds lists its first 80 cards in about 1 s instead of 16, the list is headed with every match, and the next page loads as the selection nears the end (#5487). MCP `recall` runs one index search where it ran two, the project's answer cut from the machine's: 2.4 s to 1.3 s outside any known project, 2.2 s to 1.4 s inside one, same page (#5486). A session the trust policy withholds no longer takes a slot in a large search's pool or counts toward its total (#5488).
+- A search over sessions that share turns but each go on past them no longer
+  compares every pair: 6,000 such sessions answer in 0.43 s instead of 5.1 s
+  (#5523).
+- A search over many unrelated sessions that open on the same turn no longer
+  compares them in pairs: 6,000 answer in 0.33 s instead of 9.7 s (#5549).
+- MCP `recall`'s `limit` says it is per ~4 KB page, and a page that ran out of
+  room before reaching `limit` says `(page full)` on its paging line, so a
+  caller knows a bigger limit won't fit more (#5511).
+- A search over many sessions holding the same turns no longer goes
+  quadratic: 2,400 identical sessions answer in 0.9 s where 0.23.0 ran past
+  15 s (#5499).
+- A transcript that lands between `deja index`'s freshness check and its pass
+  is no longer lost or doubled, and a file rewritten after its stat is read
+  again (#5503).
+- A command removed from transcripts sharing an id leaves `commands.gob` on the
+  next pass (#5477).
+- Copies of one session id in several project directories give a pass and a
+  rebuild the same command tables, facts and fixes, including a copy that takes
+  the row from another project and a deleted copy that kept turns it shared
+  (#5492, #5508, #5509, #5510).
+- With `DEJA_EXCLUDE_HARNESSES` set, `deja stats`, `deja sources`, the empty
+  search and the first screen count project patterns and name the setting that
+  excluded each store, instead of blaming the exclude file (#5401).
+- `deja uninstall opencode` takes deja's entry out of a tui.json that has
+  comments, and uninstall keeps a comment the reader wrote on the list entry
+  before deja's, in tui.json and OpenClaw's load paths (#5313, #5557).
+- A transcript read again after a change no longer keeps an empty tool-output
+  record for a tool result that was only a `<deja-recall>` block, so it matches
+  a rebuild (#5555).
+
+## [0.23.0] - 2026-10-21
+
+Big stores are cheap to keep up to date. A pass that replaces a few sessions
+appends their records instead of writing the whole log again and reads only
+what changed: on a 40,000-session store 20 rewritten transcripts take 1.7 s
+instead of 24 s, and peak memory drops from 7 GB to under 1 GB. A search for a
+word most sessions hold answers in about a second instead of 24. Text taken
+out of a transcript leaves the index on the next pass. For busy machines there
+are `DEJA_NO_AUTO_INDEX` and `DEJA_SEARCH_ONLY`, and `deja index` exits 3 on a
+partial run. Sub-agents are sessions of their own in every reader that marks
+one, forks no longer take credit for what they copied, and recalled history
+can no longer run a command in opencode or end a dsh turn. The index is rebuilt
+once on upgrade.
+
+A search for a word most sessions hold no longer reads all of them to show a page. Past 1,000 matches it ranks them first from the postings and the manifest, then reads the 1,000 that can reach the page and 200 more that check its length estimate; the total still counts every match, and `--all` scores every one as before. On a 40,000-session store a word in every session takes 1.1 s and 370 MB instead of 24 s and 2.6 GB, and MCP `recall` 2.5 s instead of 30 s (#5467).
+
+The first index pass after a full build that rewrites, deletes or renames transcripts no longer reads the whole record log for the command-failure table: on a 40,000-session store, 20 rewritten transcripts take 4.0 s instead of 21 s, and the build leaves the table's state for that pass to start from (#5465). Renaming a transcript that shares its session with another file reads the session again only when the rename moves it past another of its files; 20 renames on the same store take 3.2 s instead of 20 s (#5466).
+`deja --re` anchors `^` and `$` at each line, as grep does. They anchored the whole message, so `^panic:` missed a panic printed after any other tool output (#5448).
+`deja embed` no longer sends a whole Cursor, Continue or Cline session again each time it grows. Those harnesses date unstamped turns from the file's modification time, and the vector identity held the time; it now holds only the session, role and text, so a session grown by one exchange embeds 2 records instead of every one. A version 2 sidecar is rekeyed on the next run without embedding again (#4976).
+
+A search excerpt keeps the line that matched when it looks like tool noise. Searching `assignment to entry in nil map` showed the stack frames of a Go test panic and dropped the `panic:` line itself; `panic:`, `goroutine N`, `npm ERR!` and numbered lines are still left out when they do not hold the match (#5456). A `--re` search that finds nothing suggests a looser pattern, dropping `^`/`$`, or plain words, instead of "try fewer words or --re" (#5457).
+
+`deja sync import` also leaves out a peer's records for a store `DEJA_EXCLUDE_HARNESSES` (or a `harness:` line) excludes and for a project the policy `ignore` rule covers, and says how many; a relay no longer sends an excluded store's sessions on (#5435). The `sync-timer` unit carries the `DEJA_*` and `XDG_*` settings of the shell it was installed from, so a timer run syncs into the same index under the same switches (#5436).
+
+A dsh turn no longer fails when recalled history contains `{{...}}`. dsh read deja's project digest and recall as prompt templates, so a past session quoting `{{cwd}}` ended every new turn with `unknown prompt variable` before the model was called; both contexts now pass `interpolate: false` and split the braces (`{ {cwd} }`), which dsh before 0.2.1-alpha.2 needs, in the npm plugin and in `deja install dsh-auto` (#5421).
+`deja sync` holds a peer's records to this machine's switches: `DEJA_INDEX_TOOL_OUTPUT=0`, `DEJA_INDEX_COMMANDS=0`, `DEJA_INDEX_PATHS=0`, `DEJA_INDEX_EDITS=0`, `DEJA_INDEX_WRITES=0` and `DEJA_INCLUDE_SUBAGENTS=0` leave the same records out of an import as out of a local read, and the import says how many (#5425).
+Recalled history can no longer make opencode run a command or attach a file. opencode expands `` !`cmd` `` and `@path` in the `/deja` prompt text and `@path` in a sub-agent's task prompt, so a past session quoting either ran it in the shell or shipped the file to the model; deja now breaks up those tokens in the recall it hands opencode and Kilo, and the model still reads every word (#5433, #5439).
+A deleted transcript that shared its session with another file keeps every turn it held. Deleting a copy that did not own the row dropped the turns only it had, a rebuild filed shared turns under the copy still on disk, and a later rewrite of that copy took them out of the index. A renamed copy and a file that moved to another session id now give the row to the file a rebuild picks, and a new file holding only a deleted transcript's last turn is no longer taken for the transcript moved (#5441, #5442, #5443, #5444, #5445).
+A session that says the search in its own words in one message is no longer buried by sessions that hold other forms of the same common words: on a 3,000-session Russian test store where every word is common, the 12 queries worded as the target said them find it in the top five 12 times, against 9 (first 10 against 8) (#5369).
+
+Text pasted into a Claude Code prompt is indexed as the pasted text, without the `<pasted_content id="…">` wrapper Claude Code puts around it. The tags titled sessions (`<pasted_content id="dd73"> Set up and test…`), gave the install's demo question the topic "pasted_content set" and were indexed and recalled as terms; the prompt hook no longer searches on them either. The index rebuilds once to take them out of sessions already stored, including those whose transcript Claude Code has since deleted, and a peer on an older build syncs its prompts in unwrapped.
+
+A sub-agent run is a session of its own under the session that spawned it.
+Sub-agents are now read by default as their task, answer and edits, the way
+Claude Code's are, so `deja blame` names the sub-agent that wrote a line;
+`DEJA_INCLUDE_SUBAGENTS=0` leaves them out and `=1` takes the whole run in
+every reader that marks one, Gemini, Hermes, OpenClaw, Codex, opencode, Grok,
+pi, Crush, Kiro, Devin, dsh, Muse and CodeBuddy included (#5301). A CodeWhale
+fork is a fork, not a sub-agent, and is read whole. `deja resume` on a Cursor CLI
+subagent names the parent to resume instead of saying the child left
+cursor-agent's store; Hermes and OpenClaw children reopen as they are (#5303).
+Copilot CLI task runs are split out of the parent's log, OpenClaw children and
+Hermes delegates hang under their parent whatever source they ran under, and
+Gemini, Kimi and OpenClaw sub-agents are titled by their task rather than by
+injected context or their answer. Sub-agent runs stay out of the start digest.
+
+A fork no longer takes credit for what it copied. A Codex `fork_context`
+sub-agent, a Grok `--fork-session` copy, a Kimi `/fork`, a goose fork and an
+OpenClaw fork child keep only their own turns, and Claude Code `/branch`,
+Copilot `/fork`, Grok, Kimi, goose and OpenClaw forks name the session they came
+from. Where a copy still holds its source's records at their original times
+(Claude `/branch`, Qwen `/branch`, opencode `--fork`), blame credits the source.
+Relative paths in opencode `apply_patch`, Hermes `write_file` and `patch`, Kimi
+`Write`/`Edit`, and a Codex `apply_patch` run through the shell are filed under
+the session's directory, so blame finds their writer.
+
+A session is no longer recalled to itself or to its own lineage. A fork,
+`/branch`, resume or sub-agent in Claude Code, opencode, Copilot, Gemini,
+Hermes, Qwen, Kimi, Cline, Kiro, aider, Grok, pi, goose and dsh leaves out the
+session it came from, and a dsh session's sub-agents stay out of its recall at
+any depth. A resume gets one start digest, not two, Grok and pi included. The
+session that just ended shows up in the next one's digest, including the first
+session in a new project, sessions Hermes still holds in `state.db-wal` and
+Kimi Code 2.x sessions, which now get their project.
+
+`deja install` and `uninstall` leave the client's own config alone. A
+`"disabled": true` that the client ignores is no longer read as off, Claude
+Code and Kimi Code included, and the client's own switch, extra keys, comments
+and empty blocks survive install and uninstall for Codex, Cursor, Gemini,
+Hermes, Kiro, goose, dsh, pi, Qwen, Grok, aider, Kimi, Copilot, OpenClaw and
+opencode. A read-only file is refused before anything is written, Cline and
+Kimi included. pi 0.99 and later need no MCP adapter, and
+`PI_CODING_AGENT_DIR` is followed. OpenClaw install and doctor say when
+`plugins.allow` or `plugins.enabled` keeps deja's plugin off.
+
+OpenClaw, Codex, Hermes and Grok start MCP servers with only a few
+variables, so `deja mcp` there lost a moved index (`DEJA_INDEX_DIR`,
+`XDG_CACHE_HOME`), built a second one and answered recall with the asking
+session. Their MCP entries now name the launcher the hooks run through; a
+one-line Hermes entry is written out as a block with its keys and comment kept.
+
+An OpenClaw heartbeat poll no longer stamps the main DM as in use, which hid
+it from recall in the user's other sessions for twenty minutes after each poll,
+and a poll and its `NO_REPLY` are no longer indexed as a session.
+
+`openclaw chat` and `openclaw tui --local` run no plugin or hook, so deja
+cannot give them a digest or per-prompt recall; install and doctor now say
+so. MCP recall there leaves out the session OpenClaw wrote to last when no
+hook stamped one, instead of answering with the conversation asking.
+
+`deja resume` and `deja handoff --to openclaw` open OpenClaw's gateway TUI
+(`openclaw tui`) when a gateway answers, where deja's plugin and hooks run,
+and say so when only the hookless local mode (`openclaw chat`) is there.
+
+`deja install openclaw` and `openclaw-auto` refuse a section openclaw.json
+keeps in its own file (`$include`) and say what to add there by hand. Writing
+beside the `$include` made OpenClaw's own edits of that section land in
+openclaw.json instead of the included file. The launcher, plugin and hook pack
+those entries name are written before the refusal, doctor reads the included
+files, switches and the conversation-access grant there included, and names
+the file a switch is in, and uninstall names the entries it leaves there. An upgrade that moves
+an entry to the launcher no longer says it replaced the same deja.
+
+An OpenClaw sub-agent on a JSONL store stays under the window that spawned
+it after a `/new`; it was filed under the key's newer session.
+
+A fork's source stays on the fork's page when the source went on after the
+fork, and recall, the per-prompt hook and the start digest give the fork only
+what the source did from the fork point on. Search drops a fork's copied hits
+before the cap, so they no longer take a slot or count in the total, and `deja
+last` marks a fork beside its source. Blame no longer credits a Claude
+`--fork-session` copy with a line its source wrote, and file blame lists the
+session that wrote the file above one that only named it.
+
+The pre-edit note counts a fork's source only for edits after the fork, and a
+Claude Code `--resume <id> --fork-session` fork leaves its source out of the
+first prompt's recall and the first tool's note too; deja reads the source id
+from claude's command line (not on Windows).
+
+A transcript with a new mtime and the same size is no longer re-read, and one
+file that can't be appended no longer sends the rest of the pass through a full
+re-parse: a 400 MB transcript that grew 281 KB next to a touched 100 MB one
+took 25 s to index, now about 2 s.
+
+A pass that rewrites the index no longer re-encodes and re-tokenizes every
+session it keeps: they are copied as stored and keep their postings. On a
+12,000-session store a pass over 9 changed transcripts took 45 s, now 7 s
+(#5383).
+
+A pass that replaces a few sessions no longer writes the whole store again: it
+appends their records, marks the old ones dead and puts the new postings in
+small overlay files, and the log is written out again only once dead records
+are a quarter of it. On a 25,000-session store a pass over 9 rewritten
+transcripts wrote 798 MB and peaked at 2.5 GB of memory; now it writes 21 MB,
+most of it the manifest, and peaks at 310 MB. A new transcript no longer
+rewrites every postings file either: 225 MB and 2.4 GB there, now 18 MB and
+150 MB. The index is rebuilt once for the new layout (#5387). The replaced
+records are zeroed where they stand on the same pass, and so is a word only they
+held in the postings files, so text taken out of a transcript leaves the index
+then rather than at the next compaction (#5429), and an older deja
+meeting the index can no longer bring them back as live (#5428). CJK words
+are overwritten too (#5452), a `show` running across the pass no longer gets the
+session back empty (#5449), and `deja index` on an index that looks up to date
+finishes the zeroing a killed pass left (#5450). A lost
+overlay file reads as damage and rebuilds (#5426).
+
+A pass that reads Codex's, TRAE's or Claude Code's history.jsonl beside other
+changes replaces only the sessions with a new prompt in it, not every session
+known from the log alone (#5403).
+A search no longer pays for the size of the store before it has found
+anything. On a 12,000-session store a Russian recall that looks for a word
+glued to another took 1.8-3.3 s, now 0.15-0.3 s, and checking what changed
+since the last pass takes 30 ms instead of 190 ms (#5386).
+A Codex line of a hundred megabytes, a command's whole output, no longer
+holds several copies of itself in memory: a JSONL line past 1 MB is decoded as
+it streams, each string kept to the 1 MB a message is cut to anyway. An
+incremental pass over one went from 628 MB to 42 MB peak. Every line that is
+not one JSON object now counts as skipped; a `null` line or one with more after
+the object went uncounted (#5391).
+A Claude Code or Cherry Studio line of a hundred megabytes is streamed the
+same way, and so are the checks the incremental pass makes before it reads a
+Claude, Copilot, TRAE or Codex tail, and `deja changes`: indexing a Claude
+transcript with a 100 MB tool output went from 925 MB to 36 MB peak, 4.3 s to
+0.9 s (#5414).
+
+After a pass rewrites the index, the friction texts, the command-failure table
+and the record offset table are brought up to date from the sessions the pass
+changed instead of each reading the whole record log again: 2.0 s to 1.75 s
+per pass on a 12,000-session store (#5402).
+
+When two transcripts hold the same session id, a pass that rewrites one reads
+the other again too, so a turn both hold is no longer indexed twice and a copy's
+turns are no longer dropped until `deja index --rebuild`.
+
+OpenClaw: a heartbeat answered with `HEARTBEAT_OK` is not a session either; a
+sub-agent whose spawning window was archived as `.zst` keeps its parent, and
+finding the spawning window reads each transcript once instead of once per
+child.
+
+Codex no longer warns on every start that deja's SessionEnd timeout was
+clamped to 3 s. After a `kimi -p` run the session is no longer hidden from
+the next session's recall for 20 minutes. In the light theme on a 256-colour
+terminal, key chips no longer melt into their panel.
+ё and е are one letter in the index and in queries, so «ещё» finds a session
+that says «еще» and the other way round.
+
+Semantic search works with models trained with instruction prefixes, such as
+multilingual E5: `DEJA_EMBED_QUERY_PREFIX` and `DEJA_EMBED_PASSAGE_PREFIX` are
+put in front of queries and indexed texts. Vectors made with another model or
+passage prefix are no longer compared with the query: search says so once and
+goes on lexically. A long-running `deja mcp` keeps the parsed vector sidecar
+between semantic searches and lets it go two minutes after the last one.
+
+`DEJA_NO_AUTO_INDEX=1`, or `"auto_index": false` in policy.json, stops every
+automatic index update, for a busy machine that runs `deja index` from cron.
+Search, show, MCP tools and hooks answer from the last finished index and say
+when it was updated; with no index they print `deja index` instead of building
+one, and neither the agent nor a hook can start a refresh (#5385).
+`deja index` without `--rebuild` now notices a transcript it may not read and
+a store directory it may not list, and says so on every run while they stay
+locked instead of "index is up to date". Sessions already indexed from them stay
+searchable, a locked directory no longer reads as deleted, and `deja doctor`
+names a locked transcript even when it is not the newest one (#5393).
+
+`deja index` exits 3 when it wrote the index but left part of the input
+unread (a path it could not read, a line it skipped), so a cron job or a timer
+can tell that from a clean run; 1 still means the index was not written. Piped
+or under cron it prints one line per phase. A transcript read that moves no
+bytes for `DEJA_STORE_TIMEOUT` (ten minutes by default) is skipped and named,
+and the rest of the run goes on; a slow read that keeps moving is not cut.
+`--rebuild` reads every line again, so a store with an old line deja cannot
+use exits 3 on every rebuild (#5396).
+While a refresh runs, search and recall say which index they answer from and
+how much of the history it holds: "answering from the index of 2026-10-19
+14:02 (3 minutes ago), 7000 sessions — refreshing in the background, 3000 of
+10000 transcripts are new or changed since". After a first build cut off past its early slice they say it
+covers only the 200 most recent of the sessions found and that the older ones
+are missing, where recall used to say the newest might be (#5390).
+`DEJA_SEARCH_ONLY=1`, or `"search_only": true` in policy.json, builds the index
+for search alone and skips mining fixes, co-occurrence, commands, command
+failures and session facts: a rebuild of a 3,000-session tool-heavy store
+takes 2.7 s of CPU instead of 3.3 s. It is applied by the first build and by
+`deja index`, so a hook running under another environment does not rebuild
+the store back.
+`deja fix` then says the index is search-only instead of that nothing ever
+followed the error, and `deja how` and `deja restore` name `DEJA_INDEX_COMMANDS=0`
+or `DEJA_INDEX_EDITS=0` when those kept their data out. The commands guide lists
+what each `DEJA_INDEX_*` switch leaves out and what stops working (#5395).
+`DEJA_INDEX_TOOL_OUTPUT=0` now leaves tool output out of Claude Code, Cherry
+Studio, Crush, goose, Grok, pi and Command Code sessions too, and
+`DEJA_INDEX_COMMANDS=0` leaves commands out of goose and Copilot agent
+transcripts. Every `DEJA_INDEX_*` switch is applied to what each reader
+returns and to the context a compaction capture keeps, so a new reader gets
+them without testing them itself; opencode sessions re-read for their diffs
+get them and `DEJA_INCLUDE_SUBAGENTS` too. If you run with either switch, run
+`deja index --rebuild` once to drop what was indexed before (#5413).
+
+## [0.22.2] - 2026-10-17
+
+deja now reads Windsurf / Devin Desktop: Cascade's encrypted conversation
+files are decrypted, authenticated and indexed, and `deja install windsurf`
+adds the MCP server, a global rule, the skill and a `/deja` workflow. That
+makes 42 harnesses. Grok Build installs the plugin from this repository's own
+marketplace, and a Spec Kit extension ships with each release. The person sees
+more of what deja did: the first session names an error the machine keeps
+hitting, the weekly note names the session agents used, and dsh, Hermes,
+OpenClaw and Gemini show deja's line where the person reads it. Kimi Code and
+Qwen Code edit calls are pinned by fixtures from @beiryu.
+
+`deja delete` and `D` in the TUI erase a session from its agent and from
+deja after asking. Claude Code sessions whose transcript is gone come back as
+their prompts from `history.jsonl`, and without `zstd` a compressed rollout no
+longer makes every search rewrite the index.
+
+### Changed
+
+- deja's lines for the person fit on one line each, and a session start shows the recall receipt plus at most one once-only note (the built note, what changed, the week note, the GitHub line), so a fresh install no longer opens with four lines. The receipt drops its byte count and the docs line folds into the built note. What the model receives is unchanged.
+
+### Added
+
+- `DEJA_THEME=dracula` paints the interactive screen in the Dracula palette, for terminals themed that way. `light` and `dark` work as before, and a name deja does not know still falls back to the terminal background. From @demrom (#5106).
+- `deja delete <id>` and `D` in the TUI erase a session from its agent and from deja's index, after asking; there is no undo. `--dry-run` lists the files. Claude Code, Codex, Cursor CLI, Gemini CLI, Qwen Code, Copilot CLI, Cline CLI, Kimi Code, Grok, dsh, pi, Senpi, OpenClaw and Antigravity are removed as files, opencode through `opencode session delete`. Running sessions, shared stores and unchecked agents are refused.
 - A guide on deleting Copilot CLI session history: find the session by the id in `session.start`, not the directory name, and what `copilot --resume` loses. From @beiryu (#4965).
 - A guide on deleting Qwen Code chat history: the chat file, its sub-agent logs, and what `qwen -r` loses. From @beiryu (#4966).
 - Claude Code sessions whose transcript is gone come back as their prompts. `~/.claude/history.jsonl` keeps every typed prompt and paste with its session id after the cleanup deletes the transcript, so those sessions are searchable again, filed under the directory they ran in. Only the prompts: `deja show` says so, and `deja resume` refuses one. A session with its transcript on disk, or one deja kept after it was deleted, is left to the transcript. `DEJA_CLAUDE_HISTORY_FILE` moves the file (#5046).
 - The guide on deleting old Claude Code sessions in Chinese, with the same commands and numbers: 368 of 1,320 files are older than 30 days and hold 4% of the bytes, while the ten largest hold 86%. From @beiryu (#4970).
 - The Claude Code and Cursor memory guides in Chinese, with the same commands and numbers. From @Quartex246 (#5019, #5020).
+- The Codex CLI history guide in Chinese: where the rollouts live, why a plain `grep` stops seeing sessions older than a week, the `jq` and `sqlite3` recipes, and search and SSH sync. From @ursasi (#5085).
+- Five more guide pages in Chinese, with their commands and paths kept verbatim: deleting Codex sessions, deleting Cursor chats, Codex resume and its two errors, the Claude Code "No conversation found with session ID", and the full context window with its measured 77% / 0.2%. From @ursasi (#5080, #5081, #5082, #5083, #5084).
 - Shell completion for `deja recall`: `--project`, `--harness` with the harness names, and `--limit` in bash, zsh, fish and PowerShell, where it used to offer search flags recall refuses. zsh's command list now offers recall too. From @orshih6 (#5015).
+- A [Spec Kit](https://github.com/github/spec-kit) extension: `/speckit.deja-vu.recall` searches past agent sessions for the current feature's spec and plan and reports what was tried, decided or failed, citing session ids. It registers an optional `before_implement` hook, so `/speckit.implement` offers it and runs nothing unless you agree. Each release attaches it as `deja-spec-kit.zip`: `specify extension add deja-vu --from https://github.com/vshulcz/deja-vu/releases/latest/download/deja-spec-kit.zip`.
+- The weekly note names the session agents used, with an id `deja show` opens: `agents used "fix the JWT clock skew…" (claude) — deja show e8b6eefc-fec`. Used means an agent credited it this week with a `déjà vu: … (deja:<id>)` line; without one, the session recalled twice or more stands in. `hook-context --notes` can land in a group chat, so there it says `agents used a claude session — deja show <id>` and quotes no title. A week with nothing used reads as before, and what the model receives is unchanged (#4615).
+- Windsurf / Devin Desktop Cascade conversations are read from `~/.codeium/windsurf/cascade/*.pb` (`DEJA_WINDSURF_ROOT` moves it): typed prompts and the planner's replies, decrypted and authenticated first. A trajectory that fails authentication is skipped and counted, and `deja doctor` says how many. `deja install windsurf` writes the MCP server into `~/.codeium/windsurf/mcp_config.json`, deja's guidance block into `memories/global_rules.md` (left out, with a note, when the file would pass Cascade's 6,000-character cap), the deja-history skill into `skills/`, and a `/deja` workflow into `global_workflows/`. Cascade hooks are not wired: none of their output reaches the model. No resume: `devin-desktop --sessions` opens the Sessions window, and nothing takes a conversation id. Researched by @yearth (#308).
+- The first session after a build says one thing from the person's own history under the counts: the error this machine keeps hitting and which agents hit it, ``this machine has hit `command not found: timeout` in 32 sessions (claude, codex)``, or with no such error a question asked again days apart. `hook-context --notes` feeds plugin replies that can land in a group chat, so it names the error and never quotes a question. A history with neither keeps the one-line note, and what the model receives is unchanged (#4616).
+- In a 1:1 chat with the owner on an OpenClaw channel (Telegram, Slack, Discord and the rest), a reply answered from history gets one italic line under it: `↺ you've been here: "<topic>" · Oct 4 · deja`. Same deja call per prompt, same text for the model. It goes only on the final text reply of the same run, and only when every 1:1 signal agrees and the sender is the owner; anything unknown means no line. It needs a channel that sends replies whole (`channels.telegram.streaming.mode: "off"`); on a streaming channel deja is not asked for it. Group chats, other people's DMs, the TUI and the Control UI get nothing, and no other deja note is sent to a channel. `"receipt": false` in the plugin config turns it off. In the npm plugin and the one `deja install openclaw-auto` writes.
+- dsh web shows the person the lines deja prints for them in Claude Code: the "you have been here" receipt, and at session start what was recalled and the build and week notes. They sit in a panel above the input. The model's text is unchanged and the receipt costs no extra deja call per prompt. tui, headless and sdk profiles have no page, so there the plugin still asks deja for plain text and leaves the notes for `/deja` and the next session to show (#4982).
+- Hermes shows the person deja's lines too, with deja as the memory provider: the receipt and the session-start notes ride Hermes's own recall line, `🧠 deja · …`, in the CLI, where it used to say only "recalled 1 memory". Same one deja call per hook, and the model's text is unchanged. Hermes 0.17 has no such line, `hermes -z` and `hermes chat -Q` print none, the TUI and desktop do not keep it on screen and a gateway chat may be a group, so there deja is still asked for plain text and keeps its notes.
+- A dsh profile wired by `deja install dsh-auto` shows the same panel, from the same files the npm plugin ships. With both installed there is still one panel and one recall (#4983).
 
 ### Fixed
 
+- Without `zstd`, compressed Codex rollouts and OpenClaw archives no longer make every `deja index`, search and `deja last` rewrite the index. A file left unread for want of `zstd` is held as waiting until it changes or `zstd` is installed, and a pass looks for `zstd` once instead of once per file. 1,500 such rollouts beside 4,000 plain ones made each pass take 0.40 s instead of 0.09 s. From @notsubash (#5105).
+- `deja promote` refuses a second id instead of promoting the last one named, so a mistyped first id no longer writes a note on another session. From @WynandVStaden (#5075).
 - `deja last` and `deja show` answer from the index while another deja holds its lock instead of waiting it out. A session too new for that index, like the one a session-start refresh is still reading, still waits for it. From @Sora-bluesky (#5058).
 - `deja aider --help` and `deja goose --help` print the tool's own help, as deja's help always said they would, instead of deja's page; `deja help aider` still shows deja's (#5060).
 - The security model, architecture notes, JSON reference and guides say what the code does where they had drifted: the hook launcher's lookup order, every surface the `<deja-recall>` frame covers, the injection log among the files deja writes, redaction on sync import and `origin` on every sync record, the search fallback order and its six tiers, `--limit` defaults, and that no installer wires `hook-plan` (#5060).
@@ -37,36 +480,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The weekly note says when an agent deleted sessions deja kept: `Claude Code deleted 37 sessions this week; deja kept them — deja resume 5a1c0de0-111 --write-back`. Agents are named in one line, the id is the newest deletion, and an agent deja cannot write back to gets `deja show <id>`. A quiet week still says it. The window starts at the index pass that found each transcript gone; sessions kept before this release carry no date and are not counted.
 - The weekly note says how many sessions were deleted from disk that deja kept: `37 Claude Code sessions deleted this week; deja kept them — deja resume 5a1c0de0-111 --write-back`. It counts sessions, not their subagent runs, names the agents when the line has room, offers the newest deletion's id, and gives `deja show <id>` for an agent deja cannot write back to. A quiet week still says it. A deletion is dated by the index pass that first finds the transcript gone; whatever a store had already lost before this release, including what an older deja never marked kept, stays undated and is never counted.
 - `deja install` for Claude Code says when its cleanup is on: `Claude Code deletes transcripts after 30 days; deja keeps a copy of each one it indexes from now on`, read from `cleanupPeriodDays` (managed settings first, `CLAUDE_CONFIG_DIR` respected) and printed at 30 days or less. The setting is not changed.
-
-## [0.22.2] - 2026-10-15
-
-deja now reads Windsurf / Devin Desktop: Cascade's encrypted conversation
-files are decrypted, authenticated and indexed, and `deja install windsurf`
-adds the MCP server, a global rule, the skill and a `/deja` workflow. That
-makes 42 harnesses. Grok Build installs the plugin from this repository's own
-marketplace, and a Spec Kit extension ships with each release. The person sees
-more of what deja did: the first session names an error the machine keeps
-hitting, the weekly note names the session agents used, and dsh, Hermes,
-OpenClaw and Gemini show deja's line where the person reads it. Kimi Code and
-Qwen Code edit calls are pinned by fixtures from @beiryu.
-
-### Changed
-
-- deja's lines for the person fit on one line each, and a session start shows the recall receipt plus at most one once-only note (the built note, what changed, the week note, the GitHub line), so a fresh install no longer opens with four lines. The receipt drops its byte count and the docs line folds into the built note. What the model receives is unchanged.
-
-### Added
-
-- A [Spec Kit](https://github.com/github/spec-kit) extension: `/speckit.deja-vu.recall` searches past agent sessions for the current feature's spec and plan and reports what was tried, decided or failed, citing session ids. It registers an optional `before_implement` hook, so `/speckit.implement` offers it and runs nothing unless you agree. Each release attaches it as `deja-spec-kit.zip`: `specify extension add deja-vu --from https://github.com/vshulcz/deja-vu/releases/latest/download/deja-spec-kit.zip`.
-- The weekly note names the session agents used, with an id `deja show` opens: `agents used "fix the JWT clock skew…" (claude) — deja show e8b6eefc-fec`. Used means an agent credited it this week with a `déjà vu: … (deja:<id>)` line; without one, the session recalled twice or more stands in. `hook-context --notes` can land in a group chat, so there it says `agents used a claude session — deja show <id>` and quotes no title. A week with nothing used reads as before, and what the model receives is unchanged (#4615).
-- Windsurf / Devin Desktop Cascade conversations are read from `~/.codeium/windsurf/cascade/*.pb` (`DEJA_WINDSURF_ROOT` moves it): typed prompts and the planner's replies, decrypted and authenticated first. A trajectory that fails authentication is skipped and counted, and `deja doctor` says how many. `deja install windsurf` writes the MCP server into `~/.codeium/windsurf/mcp_config.json`, deja's guidance block into `memories/global_rules.md` (left out, with a note, when the file would pass Cascade's 6,000-character cap), the deja-history skill into `skills/`, and a `/deja` workflow into `global_workflows/`. Cascade hooks are not wired: none of their output reaches the model. No resume: `devin-desktop --sessions` opens the Sessions window, and nothing takes a conversation id. Researched by @yearth (#308).
-- The first session after a build says one thing from the person's own history under the counts: the error this machine keeps hitting and which agents hit it, ``this machine has hit `command not found: timeout` in 32 sessions (claude, codex)``, or with no such error a question asked again days apart. `hook-context --notes` feeds plugin replies that can land in a group chat, so it names the error and never quotes a question. A history with neither keeps the one-line note, and what the model receives is unchanged (#4616).
-- In a 1:1 chat with the owner on an OpenClaw channel (Telegram, Slack, Discord and the rest), a reply answered from history gets one italic line under it: `↺ you've been here: "<topic>" · Oct 4 · deja`. Same deja call per prompt, same text for the model. It goes only on the final text reply of the same run, and only when every 1:1 signal agrees and the sender is the owner; anything unknown means no line. It needs a channel that sends replies whole (`channels.telegram.streaming.mode: "off"`); on a streaming channel deja is not asked for it. Group chats, other people's DMs, the TUI and the Control UI get nothing, and no other deja note is sent to a channel. `"receipt": false` in the plugin config turns it off. In the npm plugin and the one `deja install openclaw-auto` writes.
-- dsh web shows the person the lines deja prints for them in Claude Code: the "you have been here" receipt, and at session start what was recalled and the build and week notes. They sit in a panel above the input. The model's text is unchanged and the receipt costs no extra deja call per prompt. tui, headless and sdk profiles have no page, so there the plugin still asks deja for plain text and leaves the notes for `/deja` and the next session to show (#4982).
-- Hermes shows the person deja's lines too, with deja as the memory provider: the receipt and the session-start notes ride Hermes's own recall line, `🧠 deja · …`, in the CLI, where it used to say only "recalled 1 memory". Same one deja call per hook, and the model's text is unchanged. Hermes 0.17 has no such line, `hermes -z` and `hermes chat -Q` print none, the TUI and desktop do not keep it on screen and a gateway chat may be a group, so there deja is still asked for plain text and keeps its notes.
-- A dsh profile wired by `deja install dsh-auto` shows the same panel, from the same files the npm plugin ships. With both installed there is still one panel and one recall (#4983).
-
-### Fixed
-
 - The Grok Build install line works: deja was never in `xai-org/plugin-marketplace`, so `grok plugin install deja` after adding it found nothing. This repository is a Grok marketplace now, `grok plugin marketplace add vshulcz/deja-vu` then `grok plugin install deja`; the official entry is still in review (xai-org/plugin-marketplace#332).
 - ZCode keeps the per-prompt recall when the "you have been here" line is due. `hook-prompt` ignored the `--strict` that ZCode's hook passes, so the reply carried `systemMessage` and ZCode discarded all of it, recall included.
 - Cursor no longer uses up deja's notes for the person. It shows a hook's message only when the hook blocks, so the once-only notes (the built note, the week note) and the session-start receipt went to Cursor, were counted as shown and never seen, and Claude Code on the same index skipped them. A Cursor session start now gets only the model's text, which is unchanged, and leaves those notes for the next host that shows them; a session start under `--strict` or `--copilot` does the same. A rewire after an upgrade still happens on a Cursor start, and its note is dropped there.

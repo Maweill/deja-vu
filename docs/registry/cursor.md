@@ -4,11 +4,13 @@
 
 Cursor IDE stores chats in `state.vscdb` under `globalStorage/` and `workspaceStorage/*/`. The user root is `~/Library/Application Support/Cursor/User` on macOS, `%APPDATA%\Cursor\User` on Windows and `~/.config/Cursor/User` elsewhere; on Linux an existing `$XDG_CONFIG_HOME/Cursor/User` is used when available. `DEJA_CURSOR_ROOT` overrides IDE discovery.
 
-Cursor CLI writes `projects/<encoded-path>/agent-transcripts/**/*.jsonl` below `${CURSOR_CONFIG_DIR:-~/.cursor}`. `DEJA_CURSOR_CLI_ROOT` overrides transcript reads. Subagent transcripts are excluded unless `DEJA_INCLUDE_SUBAGENTS=1` — for index
-size, not because the parent already holds that work. Unlike Claude's sidechain
-files, Cursor's have not been read here: what the parent keeps and what only the
-child has is unverified for this harness, so deja indexes them as it finds them
-rather than deriving an edge it has not seen.
+Cursor CLI writes `projects/<encoded-path>/agent-transcripts/**/*.jsonl` below `${CURSOR_CONFIG_DIR:-~/.cursor}`. `DEJA_CURSOR_CLI_ROOT` overrides transcript reads. A subagent's run is written to
+`agent-transcripts/<parent>/subagents/<child>.jsonl` (cursor-agent's transcript
+path resolver, `kind: "subagent"` with `parentConversationId`). The lines carry
+no ids, so the directory is the parent link. deja reads the child as Claude's
+sidechains: a session naming its parent, kept as its task, its answer and the
+files it changed, so `deja blame` can name the subagent that wrote a line.
+`DEJA_INCLUDE_SUBAGENTS=1` takes the whole run, `=0` leaves them out.
 
 ## IDE SQLite records
 
@@ -60,7 +62,9 @@ long path with a hash, so it cannot be read back for those. A chat whose
 directory is gone, is not recorded, or is no longer in cursor-agent's store is
 refused with `deja show` instead — `cursor-agent --resume` with no id lists
 chats from every directory. Live-verified: the resumed chat answered from its own
-history. IDE chats carry a composer id from `state.vscdb` that the CLI does not
+history. A CLI subagent is refused with its parent's id: its state lives in
+the parent's chat store and only its transcript is a file of its own, so
+`--resume` has no chat to open for it (#5303). IDE chats carry a composer id from `state.vscdb` that the CLI does not
 take, so those still reopen only in the editor. On the screen bare `deja`
 opens, `r` on a CLI chat runs this command for you, and `o` continues any chat
 in another agent.
@@ -79,7 +83,7 @@ already set there is left alone. Rendered live on cursor-agent 2026.09.02.
 - Cursor moved modern IDE chats toward global storage while older versions used workspace databases; both are scanned.
 - SQLite values are JSON inside a key-value table and malformed or null entries occur.
 - CLI project path encoding has the same separator-versus-hyphen ambiguity as Claude Code.
-- A parsed message is capped at 1 MiB. CLI subagent transcripts are opt-in.
+- A parsed message is capped at 1 MiB. CLI subagent transcripts come in as task, answer and edits; `DEJA_INCLUDE_SUBAGENTS=0` skips them.
 - Both CLI layouts are written by `cursor-agent 2026.09.02-c22c1a3`, minutes apart in the same session.
 
 **Last verified:** 2026-10-07

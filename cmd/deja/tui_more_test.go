@@ -3,7 +3,9 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -189,20 +191,30 @@ func TestTUIReaderRoles(t *testing.T) {
 }
 
 func TestTUITheme(t *testing.T) {
-	defer setTheme(false)
-	for env, want := range map[[2]string]bool{
-		{"light", ""}: true, {"dark", "0;15"}: false, {"", "0;15"}: true, {"", "15;0"}: false, {"", ""}: false, {"", "0;default;7"}: true,
+	defer setTheme("dark")
+	for env, want := range map[[2]string]string{
+		{"light", ""}: "light", {"dark", "0;15"}: "dark", {"", "0;15"}: "light", {"", "15;0"}: "dark", {"", ""}: "dark",
+		{"", "0;default;7"}: "light", {"Dracula", "0;15"}: "dracula", {"solarized", "0;15"}: "light",
 	} {
 		t.Setenv("DEJA_THEME", env[0])
 		t.Setenv("COLORFGBG", env[1])
-		if got := lightTerminal(); got != want {
-			t.Errorf("lightTerminal(%v) = %v", env, got)
+		if got := terminalTheme(); got != want {
+			t.Errorf("terminalTheme(%v) = %q, want %q", env, got, want)
 		}
 	}
+	setTheme("dark")
 	dark := cBase
-	setTheme(true)
+	setTheme("light")
 	if cBase == dark {
 		t.Error("the light set replaces the colours")
+	}
+	setTheme("dracula")
+	if cBase != tui.Hex("#282a36") || cAcc != tui.Hex("#bd93f9") {
+		t.Error("dracula paints Dracula's background and purple")
+	}
+	setTheme("solarized")
+	if cBase != dark {
+		t.Error("an unknown theme falls back to dark")
 	}
 }
 
@@ -248,4 +260,72 @@ func TestTUIContinueRecentAndFold(t *testing.T) {
 	if ts := a.shownTargets(); ts[0].id != "kiro" || a.m.sel != 0 {
 		t.Errorf("the newest pick leads and is selected: %+v", ts[0])
 	}
+}
+
+// Without truecolor every colour rounds to the xterm-256 cube; two surfaces
+// that land on one entry make the selected card and the panels vanish.
+func TestThemeSurfacesStayApartIn256Colours(t *testing.T) {
+	for name, p := range palettes {
+		base := tui.To256(tui.Hex(p[0]))
+		for _, hex := range p[2:4] { // the card surface and the panels
+			if n := tui.To256(tui.Hex(hex)); n == base {
+				t.Errorf("%s: %s lands on the background's xterm %d", name, hex, n)
+			}
+		}
+	}
+}
+
+// Key chips and buttons fill with surf2 on surf panels; in light theme both
+// rounded to xterm 254 and the chips lost their fill (#5107). Truecolor keeps
+// the palette's own hex.
+func TestThemeChipsStayApartFromTheirPanelIn256Colours(t *testing.T) {
+	t.Cleanup(func() { setTheme("dark") })
+	for name, p := range palettes {
+		setTheme(name)
+		if s, s2 := tui.To256(cSurf), tui.To256(cSurf2); s == s2 {
+			t.Errorf("%s: surf and surf2 both land on xterm %d", name, s)
+		}
+		c := tui.NewCanvas(1, 1)
+		c.Fill(0, 0, 1, 1, cSurf2)
+		if l, want := c.Lines(tui.ModeTrue)[0], "48;2;"+rgbArgs(p[3]); !strings.Contains(l, want) {
+			t.Errorf("%s: truecolor surf2 = %q, want %s", name, l, want)
+		}
+	}
+}
+
+// The header bar and code blocks fill with mantle on a base page; in light
+// theme both rounded to xterm 255 and the bar melted into the page (#5355).
+// Mantle has no grey between base and surf to take, so it must also keep off
+// the entries the chips and panels use.
+func TestThemeHeaderStaysApartFromThePageIn256Colours(t *testing.T) {
+	t.Cleanup(func() { setTheme("dark") })
+	for name := range palettes {
+		setTheme(name)
+		m := tui.To256(cMantle)
+		for what, c := range map[string]tui.Color{"base": cBase, "surf": cSurf, "surf2": cSurf2} {
+			if tui.To256(c) == m {
+				t.Errorf("%s: mantle and %s both land on xterm %d", name, what, m)
+			}
+		}
+	}
+	dir, _ := tuiStore(t)
+	t.Setenv("DEJA_THEME", "light")
+	a := newTestTUI(t, dir)
+	setTheme("light")
+	lines := a.frame(100, 30).Lines(tui.Mode256)
+	bg := regexp.MustCompile(`48;5;(\d+)`)
+	header := bg.FindStringSubmatch(lines[0])
+	page := "48;5;" + strconv.Itoa(tui.To256(cBase))
+	if header == nil || header[0] == page {
+		t.Errorf("light header bar fills with %v, the page with %s:\n%q", header, page, lines[0])
+	}
+	if !strings.Contains(strings.Join(lines[1:], "\n"), page) {
+		t.Errorf("control: no cell below the header fills with the page's %s", page)
+	}
+}
+
+func rgbArgs(hex string) string {
+	c := tui.Hex(hex)
+	r, g, b := uint64(c)>>16&0xff, uint64(c)>>8&0xff, uint64(c)&0xff
+	return strconv.FormatUint(r, 10) + ";" + strconv.FormatUint(g, 10) + ";" + strconv.FormatUint(b, 10)
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/vshulcz/deja-vu/internal/sources"
@@ -10,6 +11,10 @@ import (
 
 // runCompletion writes a shell-specific script so the binary stays dependency-free.
 func runCompletion(args []string) error {
+	if len(args) > 1 {
+		// One shell was given; "needs bash, ..." read as if none was (#5077).
+		return fmt.Errorf("completion takes one shell, got %q and %q", args[0], args[1])
+	}
 	if len(args) != 1 {
 		return fmt.Errorf("completion needs bash, zsh, fish, or powershell")
 	}
@@ -28,6 +33,14 @@ func runCompletion(args []string) error {
 	// The last hand-written list: seven copies of "user assistant tool" while
 	// --role accepted four more (#1658).
 	script = strings.ReplaceAll(script, "%ROLES%", strings.Join(knownRoles, " "))
+	// The promote states come from the map promote checks against, sorted
+	// because a map has no order of its own (#5066).
+	states := make([]string, 0, len(sources.NoteStates))
+	for s := range sources.NoteStates {
+		states = append(states, s)
+	}
+	sort.Strings(states)
+	script = strings.ReplaceAll(script, "%NOTE_STATES%", strings.Join(states, " "))
 	// And the command list itself, which was the last copy left: `deja recap`
 	// and `deja tests` shipped in 0.21.0 and bash and fish had never heard of
 	// either, while the PowerShell array had grown three overlapping copies of
@@ -65,7 +78,7 @@ _deja_completion() {
     local install_targets="%INSTALL_TARGETS% --all --auto"
 
     if (( COMP_CWORD == 1 )); then
-        COMPREPLY=( $(compgen -W "$commands --version -version --json --re --all --no-embed --harness --project --since --role --session --rebuild --quiet --limit" -- "$cur") )
+        COMPREPLY=( $(compgen -W "$commands --version -version --json --re --all --no-embed --harness --project --since --role --session --rebuild --limit --sort" -- "$cur") )
         return
     fi
 
@@ -91,6 +104,9 @@ _deja_completion() {
             ;;
         doctor)
             COMPREPLY=( $(compgen -W "--json --offline --deep --all" -- "$cur") )
+            ;;
+        delete)
+            COMPREPLY=( $(compgen -W "--dry-run --yes" -- "$cur") )
             ;;
         forget)
             COMPREPLY=( $(compgen -W "--list --dry-run --session --project --before --unforget --all-matches" -- "$cur") )
@@ -127,7 +143,7 @@ _deja_completion() {
             if [[ "$prev" == "--harness" ]]; then
                 COMPREPLY=( $(compgen -W "$harnesses" -- "$cur") )
             else
-                COMPREPLY=( $(compgen -W "--project --harness --limit" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--project --harness --limit --offset" -- "$cur") )
             fi
             ;;
         remember)
@@ -194,14 +210,64 @@ _deja_completion() {
                 COMPREPLY=( $(compgen -W "--json --harness --offset --limit" -- "$cur") )
             fi
             ;;
-        check|ctx|embed|hook-precompact|hook-prompt|mcp|share|sources|statusline|update|version|warmup)
+        update)
+            COMPREPLY=( $(compgen -W "--force" -- "$cur") )
+            ;;
+        wip)
+            COMPREPLY=( $(compgen -W "--json" -- "$cur") )
+            ;;
+        log)
+            COMPREPLY=( $(compgen -W "--last --json" -- "$cur") )
+            ;;
+        view)
+            if [[ "$prev" == "--out" ]]; then
+                COMPREPLY=( $(compgen -f -- "$cur") )
+            else
+                COMPREPLY=( $(compgen -W "--out --no-open" -- "$cur") )
+            fi
+            ;;
+        recap)
+            if [[ "$prev" == "--since" || "$prev" == "--limit" ]]; then
+                COMPREPLY=()
+            else
+                COMPREPLY=( $(compgen -W "--since --limit --json" -- "$cur") )
+            fi
+            ;;
+        files|how)
+            if [[ "$prev" == "--project" || "$prev" == "--limit" ]]; then
+                COMPREPLY=()
+            else
+                COMPREPLY=( $(compgen -W "--project --all-projects --limit --json" -- "$cur") )
+            fi
+            ;;
+        promote)
+            if [[ "$prev" == "--state" ]]; then
+                COMPREPLY=( $(compgen -W "%NOTE_STATES%" -- "$cur") )
+            elif [[ "$prev" == "--to" ]]; then
+                COMPREPLY=( $(compgen -f -- "$cur") )
+            elif [[ "$prev" == "--note" || "$prev" == "--tag" ]]; then
+                COMPREPLY=()
+            else
+                COMPREPLY=( $(compgen -W "--state --note --tag --to" -- "$cur") )
+            fi
+            ;;
+        fix|friction|tests)
+            if [[ "$prev" == "--limit" ]]; then
+                COMPREPLY=()
+            else
+                COMPREPLY=( $(compgen -W "--limit --json" -- "$cur") )
+            fi
+            ;;
+        brief|check|ctx|embed|hook-precompact|hook-prompt|mcp|share|sources|statusline|version|warmup)
             COMPREPLY=()
             ;;
         *)
             if [[ "$prev" == "--harness" ]]; then
                 COMPREPLY=( $(compgen -W "$harnesses" -- "$cur") )
+            elif [[ "$prev" == "--sort" ]]; then
+                COMPREPLY=( $(compgen -W "relevance date" -- "$cur") )
             else
-                COMPREPLY=( $(compgen -W "--json --re --all --no-embed --harness --project --since --role --session --rebuild --quiet --limit" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--json --re --all --no-embed --harness --project --since --role --session --rebuild --limit --sort" -- "$cur") )
             fi
             ;;
     esac
@@ -228,6 +294,7 @@ _deja() {
     'recap:what the last week settled, with receipts'
     'recall:the page the MCP recall tool gives an agent'
     'how:commands this machine actually ran for a thing'
+    'delete:erase a session from its agent and from deja'
     'doctor:diagnose local stores and wiring'
     'promote:distill a session into a curated note'
     'rules:copy your rules file into every agent, or list your corrections'
@@ -283,6 +350,9 @@ _deja() {
     doctor)
       _arguments '--json[print JSON]' '--offline[skip version check]' '--deep[verify index against sources]' '--all[list every store, missing ones included]'
       ;;
+    delete)
+      _arguments '--dry-run[list the files, remove nothing]' '--yes[do not ask]' '1:session ID prefix:'
+      ;;
     forget)
       _arguments '--list[list tombstones]' '--dry-run[show changes without applying]' '--session=[session ID prefix]:session:' '--project=[project substring]:project:' '--before=[duration or date]:time:' '--unforget=[tombstone ID]:ID:' '--all-matches[act on every match]'
       ;;
@@ -305,7 +375,7 @@ _deja() {
       _arguments '--json[print JSON]' '--from=[which machine]:origin:(machine local)' '--harness=[filter by harness]:harness:($harnesses)' '--project=[filter by project]:project:' '--since=[filter by age]:duration:' '--role=[filter by role]:role:(%ROLES%)' '1:count:'
       ;;
     recall)
-      _arguments '--project=[project name]:project:' '--harness=[filter by harness]:harness:($harnesses)' '--limit=[maximum sessions]:count:' '*:query:'
+      _arguments '--project=[project name]:project:' '--harness=[filter by harness]:harness:($harnesses)' '--limit=[maximum sessions]:count:' '--offset=[sessions to skip]:count:' '*:query:'
       ;;
     remember)
       _arguments '--project=[note project]:project:' '*--tag=[tag the note, repeatable]:tag:' '1:text:'
@@ -345,10 +415,38 @@ _deja() {
     show)
       _arguments '--json[print JSON]' '--harness=[filter by harness]:harness:($harnesses)' '--offset=[skip leading messages]:count:' '--limit=[cap messages printed]:count:' '1:session ID prefix:'
       ;;
-    check|ctx|embed|hook-precompact|hook-prompt|mcp|share|sources|statusline|update|version|warmup)
+    update)
+      _arguments '--force[write over a binary a package manager owns]'
+      ;;
+    wip)
+      _arguments '--json[print JSON]'
+      ;;
+    log)
+      _arguments '--last[print the most recent injected digest]' '--json[print JSON]' '1:count:'
+      ;;
+    view)
+      _arguments '--out[write the page to a file]:file:_files' '--no-open[do not open the browser]'
+      ;;
+    recap)
+      _arguments '--since[how far back, a duration like 30d (default 7d)]:duration:' '--limit[maximum sessions]:count:' '--json[print JSON]'
+      ;;
+    files|how)
+      _arguments '--project[project name]:project:' '--all-projects[search every project, not just this one]' '--limit[maximum results]:count:' '--json[print JSON]' '*:topic:'
+      ;;
+    promote)
+      if [[ "$words[CURRENT-1]" == "--state" ]]; then
+        _values 'state' %NOTE_STATES%
+      else
+        _arguments '--state[mark the note]:state:(%NOTE_STATES%)' '--note[the note text]:text:' '*--tag[tag the note, repeatable]:tag:' '--to[also append the note to a Markdown file]:file:_files' '1:session ID prefix:'
+      fi
+      ;;
+    fix|friction|tests)
+      _arguments '--limit[max results]:count:' '--json[print JSON]'
+      ;;
+    brief|check|ctx|embed|hook-precompact|hook-prompt|mcp|share|sources|statusline|version|warmup)
       ;;
     *)
-      _arguments '--json[print JSON]' '--re[interpret query as a regular expression]' '--all[include all results]' '--no-embed[skip semantic reranking]' '--harness=[filter by harness]:harness:($harnesses)' '--project=[filter by project]:project:' '--since=[filter by age]:duration:' '--role=[filter by role]:role:(%ROLES%)' '--session=[only one session]:id:' '--rebuild[force a full rebuild]' '--quiet[say nothing when it worked]' '--limit=[max sessions to return (1-100)]:count:'
+      _arguments '--json[print JSON]' '--re[interpret query as a regular expression]' '--all[include all results]' '--no-embed[skip semantic reranking]' '--harness=[filter by harness]:harness:($harnesses)' '--project=[filter by project]:project:' '--since=[filter by age]:duration:' '--role=[filter by role]:role:(%ROLES%)' '--session=[only one session]:id:' '--rebuild[force a full rebuild]' '--limit=[max sessions to return (1-100)]:count:' '--sort=[order of the results]:order:(relevance date)'
       ;;
   esac
 }
@@ -373,6 +471,8 @@ complete -c deja -n '__deja_needs_command' -l session -r
 complete -c deja -n '__deja_needs_command' -l rebuild
 complete -c deja -n '__deja_needs_command' -l limit -r -d 'Max sessions to return (1-100)'
 complete -c deja -n '__fish_seen_subcommand_from search' -l limit -r -d 'Max sessions to return (1-100)'
+complete -c deja -n '__deja_needs_command' -l sort -x -a 'relevance date' -d 'Order of the results'
+complete -c deja -n '__fish_seen_subcommand_from search' -l sort -x -a 'relevance date' -d 'Order of the results'
 
 complete -c deja -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish powershell pwsh'
 complete -c deja -n '__fish_seen_subcommand_from blame' -l attribution -d 'Show line attribution'
@@ -391,6 +491,8 @@ complete -c deja -n '__fish_seen_subcommand_from doctor' -l json
 complete -c deja -n '__fish_seen_subcommand_from doctor' -l offline
 complete -c deja -n '__fish_seen_subcommand_from doctor' -l deep
 complete -c deja -n '__fish_seen_subcommand_from doctor' -l all
+complete -c deja -n '__fish_seen_subcommand_from delete' -l dry-run -d 'List the files, remove nothing'
+complete -c deja -n '__fish_seen_subcommand_from delete' -l yes -d 'Do not ask'
 complete -c deja -n '__fish_seen_subcommand_from forget; and not __fish_seen_subcommand_from sync' -l list
 complete -c deja -n '__fish_seen_subcommand_from forget; and not __fish_seen_subcommand_from sync' -l dry-run
 complete -c deja -n '__fish_seen_subcommand_from forget; and not __fish_seen_subcommand_from sync' -l session -r
@@ -404,6 +506,7 @@ complete -c deja -n '__fish_seen_subcommand_from hook-context' -l plain
 complete -c deja -n '__fish_seen_subcommand_from hook-context' -l once
 complete -c deja -n '__fish_seen_subcommand_from hook-context' -l notes
 complete -c deja -n '__fish_seen_subcommand_from index' -l rebuild
+complete -c deja -n '__fish_seen_subcommand_from index' -l quiet -d 'Say nothing when it worked'
 complete -c deja -n '__fish_seen_subcommand_from install uninstall' -a '%INSTALL_TARGETS% --all --auto'
 complete -c deja -n '__fish_seen_subcommand_from install uninstall' -l no-guidance
 complete -c deja -n '__fish_seen_subcommand_from install' -l no-index -d 'Skip indexing'
@@ -421,6 +524,7 @@ complete -c deja -n '__fish_seen_subcommand_from last' -l role -r -a '%ROLES%'
 complete -c deja -n '__fish_seen_subcommand_from recall; and not __fish_seen_subcommand_from bench' -l project -r
 complete -c deja -n '__fish_seen_subcommand_from recall; and not __fish_seen_subcommand_from bench' -l harness -r -a '%HARNESSES%'
 complete -c deja -n '__fish_seen_subcommand_from recall; and not __fish_seen_subcommand_from bench' -l limit -r
+complete -c deja -n '__fish_seen_subcommand_from recall; and not __fish_seen_subcommand_from bench' -l offset -r
 complete -c deja -n '__fish_seen_subcommand_from remember' -l project -r
 complete -c deja -n '__fish_seen_subcommand_from remember' -l tag -r
 complete -c deja -n '__fish_seen_subcommand_from rules; and not __fish_seen_subcommand_from sync status candidates' -f -a 'sync status candidates'
@@ -449,6 +553,25 @@ complete -c deja -n '__fish_seen_subcommand_from stats' -l harness -r -a '%HARNE
 complete -c deja -n '__fish_seen_subcommand_from stats' -l project -r
 complete -c deja -n '__fish_seen_subcommand_from stats' -l since -r
 complete -c deja -n '__fish_seen_subcommand_from stats' -l role -r -a '%ROLES%'
+complete -c deja -n '__fish_seen_subcommand_from update' -l force -d 'Write over a binary a package manager owns'
+complete -c deja -n '__fish_seen_subcommand_from wip' -l json
+complete -c deja -n '__fish_seen_subcommand_from log' -l last -d 'Print the most recent injected digest'
+complete -c deja -n '__fish_seen_subcommand_from log' -l json
+complete -c deja -n '__fish_seen_subcommand_from view' -l out -r -F -d 'Write the page to a file'
+complete -c deja -n '__fish_seen_subcommand_from view' -l no-open -d 'Do not open the browser'
+complete -c deja -n '__fish_seen_subcommand_from fix friction tests' -l limit -x -d 'Max results'
+complete -c deja -n '__fish_seen_subcommand_from fix friction tests' -l json -d 'Print JSON'
+complete -c deja -n '__fish_seen_subcommand_from recap' -l since -x -d 'How far back, a duration like 30d (default 7d)'
+complete -c deja -n '__fish_seen_subcommand_from recap' -l limit -x -d 'Maximum sessions'
+complete -c deja -n '__fish_seen_subcommand_from recap' -l json
+complete -c deja -n '__fish_seen_subcommand_from files how' -l project -x
+complete -c deja -n '__fish_seen_subcommand_from files how' -l all-projects -d 'Search every project, not just this one'
+complete -c deja -n '__fish_seen_subcommand_from files how' -l limit -x
+complete -c deja -n '__fish_seen_subcommand_from files how' -l json
+complete -c deja -n '__fish_seen_subcommand_from promote' -l state -x -a '%NOTE_STATES%' -d 'Mark the note'
+complete -c deja -n '__fish_seen_subcommand_from promote' -l note -x -d 'The note text'
+complete -c deja -n '__fish_seen_subcommand_from promote' -l tag -x -d 'Tag the note, repeatable'
+complete -c deja -n '__fish_seen_subcommand_from promote' -l to -r -F -d 'Also append the note to a Markdown file'
 complete -c deja -n '__fish_seen_subcommand_from sync; and not __fish_seen_subcommand_from rules; and not __fish_seen_subcommand_from export import ssh forget' -a 'export import ssh forget'
 complete -c deja -n '__fish_seen_subcommand_from sync; and __fish_seen_subcommand_from export' -l include-imported
 complete -c deja -n '__fish_seen_subcommand_from sync; and __fish_seen_subcommand_from export' -l peer -r
@@ -467,11 +590,12 @@ Register-ArgumentCompleter -Native -CommandName deja -ScriptBlock {
     $commands = @(%COMMANDS_QUOTED%)
     $harnesses = @('%HARNESSES%' -split ' ' | Where-Object { $_ })
     $roles = @('%ROLES%' -split ' ' | Where-Object { $_ })
+    $noteStates = @('%NOTE_STATES%' -split ' ' | Where-Object { $_ })
     $installTargets = @('%INSTALL_TARGETS%' -split ' ' | Where-Object { $_ }) + @('--all', '--auto')
     $handoffTargets = @('%HANDOFF_TARGETS%' -split ' ' | Where-Object { $_ })
     $defaultOptions = @(
         '--json', '--re', '--all', '--no-embed', '--harness', '--project',
-        '--since', '--role', '--session', '--rebuild', '--limit'
+        '--since', '--role', '--session', '--rebuild', '--limit', '--sort'
     )
 
     $elements = @($commandAst.CommandElements | ForEach-Object { $_.Extent.Text })
@@ -503,13 +627,14 @@ Register-ArgumentCompleter -Native -CommandName deja -ScriptBlock {
             }
             'completion' { @('bash', 'zsh', 'fish', 'powershell', 'pwsh') }
             'doctor' { @('--json', '--offline', '--deep', '--all') }
+            'delete' { @('--dry-run', '--yes') }
             'forget' { @('--list', '--dry-run', '--session', '--project', '--before', '--unforget', '--all-matches') }
             'handoff' {
                 if ($previous -eq '--to') { $handoffTargets }
                 else { @('--to', '--exec') }
             }
             'hook-context' { @('--plain', '--once', '--copilot', '--notes') }
-            'index' { @('--rebuild', '-rebuild') }
+            'index' { @('--rebuild', '-rebuild', '--quiet', '-quiet') }
             'install' { $installTargets + @('--no-guidance', '--no-index', '--force') }
             'uninstall' { $installTargets + @('--no-guidance') }
             'last' {
@@ -519,7 +644,7 @@ Register-ArgumentCompleter -Native -CommandName deja -ScriptBlock {
             }
             'recall' {
                 if ($previous -eq '--harness') { $harnesses }
-                else { @('--project', '--harness', '--limit') }
+                else { @('--project', '--harness', '--limit', '--offset') }
             }
             'remember' { @('--project', '--tag') }
             'rules' {
@@ -551,8 +676,32 @@ Register-ArgumentCompleter -Native -CommandName deja -ScriptBlock {
                 if ($previous -eq '--harness') { $harnesses }
                 else { @('--json', '--harness', '--offset', '--limit') }
             }
-            { $_ -in @('check', 'ctx', 'embed', 'hook-precompact', 'hook-prompt', 'mcp', 'share', 'sources', 'statusline', 'update', 'version', 'warmup') } { @() }
-            default { $defaultOptions }
+            'update' { @('--force') }
+            'wip' { @('--json') }
+            'log' { @('--last', '--json') }
+            'view' {
+                if ($previous -eq '--out') { @() }
+                else { @('--out', '--no-open') }
+            }
+            'recap' {
+                if ($previous -in @('--since', '--limit')) { @() }
+                else { @('--since', '--limit', '--json') }
+            }
+            { $_ -in @('files', 'how') } {
+                if ($previous -in @('--project', '--limit')) { @() }
+                else { @('--project', '--all-projects', '--limit', '--json') }
+            }
+            'promote' {
+                if ($previous -eq '--state') { $noteStates }
+                elseif ($previous -in @('--note', '--tag', '--to')) { @() }
+                else { @('--state', '--note', '--tag', '--to') }
+            }
+            { $_ -in @('fix', 'friction', 'tests') } {
+                if ($previous -eq '--limit') { @() }
+                else { @('--limit', '--json') }
+            }
+            { $_ -in @('brief', 'check', 'ctx', 'embed', 'hook-precompact', 'hook-prompt', 'mcp', 'share', 'sources', 'statusline', 'version', 'warmup') } { @() }
+            default { if ($previous -eq '--sort') { @('relevance', 'date') } else { $defaultOptions } }
         }
     }
 
@@ -580,7 +729,7 @@ Register-ArgumentCompleter -Native -CommandName deja -ScriptBlock {
 // added to one and not the other.
 func completionCommands() []string {
 	return []string{
-		"bench", "blame", "brief", "check", "completion", "ctx", "doctor", "embed",
+		"bench", "blame", "brief", "check", "completion", "ctx", "delete", "doctor", "embed",
 		"files", "fix", "forget", "friction", "handoff", "help", "how", "index",
 		"install", "last", "log", "mcp", "promote", "recall", "recap", "remember", "restore",
 		"resume", "rules", "search", "secrets", "share", "show", "sources", "stats",

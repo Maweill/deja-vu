@@ -53,7 +53,7 @@ func defaultDoctorVersionLookup() doctorVersionLookup {
 func countSubagentFiles(seen []string) int {
 	n := 0
 	for _, p := range seen {
-		if sources.IsSubagentPath(p) || sources.IsPrimeChildPath(p) {
+		if sources.IsSubagentPath(p) || sources.IsPrimeChildPath(p) || sources.KimiSubagentRun(p) || sources.MuseSubagentFile(p) {
 			n++
 		}
 	}
@@ -887,7 +887,7 @@ func doctorHarnessStores(w io.Writer, dir string, all bool) {
 			// wanted those transcripts indexed set the thing the line said
 			// was already set. It is the remedy, and it reads as one now.
 			detail += fmt.Sprintf(", %d subagent transcripts skipped — set DEJA_INCLUDE_SUBAGENTS=1 to index them", byRule)
-		} else if short := countSubagentFiles(seen); short > 0 && os.Getenv("DEJA_INCLUDE_SUBAGENTS") != "1" {
+		} else if short := countSubagentFiles(seen); short > 0 && !sources.SubagentsWhole() {
 			// Read, but not in full: what a reader needs to know is which half
 			// of those files is searchable, and how to get the rest (#3009).
 			detail += fmt.Sprintf(", %d subagent transcripts read as task, answer and what they changed — set DEJA_INCLUDE_SUBAGENTS=1 for the whole run", short)
@@ -1186,7 +1186,7 @@ func doctorHarnessStores(w io.Writer, dir string, all bool) {
 	printFilesBesideIn("reasonix", rxRoot, sources.ReasonixSessionDirsAll(), false, doctorExists(rxRoot),
 		sources.ReasonixSessionFiles(), sources.ReasonixSidecarFiles()...)
 	// Muse keeps cron.db, goals.db and spilled tool output beside each log, and
-	// its subagents' logs one level down, read only when asked for.
+	// its subagents' logs one level down, left out with DEJA_INCLUDE_SUBAGENTS=0.
 	museRoots := sources.MuseRoots()
 	printFilesSkippingIn("muse", strings.Join(museRoots, string(os.PathListSeparator)), museRoots, doctorAnyExists(museRoots),
 		sources.MuseSessionFiles(), sources.MuseSubagentFile, sources.MuseSidecarFiles()...)
@@ -1284,7 +1284,19 @@ func doctorGooseDetail(sqlite bool) string {
 }
 
 func doctorCursorDetail(sqlite bool) string {
-	parts := []string{doctorCount(len(sources.CursorTranscripts()), "CLI transcript")}
+	transcripts := sources.CursorTranscripts()
+	cli := doctorCount(len(transcripts), "CLI transcript")
+	// By the reader's own test, which matches the directory in any case.
+	short := 0
+	for _, p := range transcripts {
+		if sources.CursorSubagentParent(p) != "" {
+			short++
+		}
+	}
+	if short > 0 && !sources.SubagentsWhole() {
+		cli += fmt.Sprintf(", %d subagent transcripts read as task, answer and what they changed — set DEJA_INCLUDE_SUBAGENTS=1 for the whole run", short)
+	}
+	parts := []string{cli}
 	dbs := sources.CursorDBs()
 	if len(dbs) > 0 {
 		var size int64
@@ -1521,12 +1533,15 @@ func doctorMCP(w io.Writer) {
 		if c.name == "cherrystudio" && doctorCherryStudioMCP(w, status, c.path) {
 			continue
 		}
-		// pi has no MCP of its own, and the file is read only by the adapter
-		// package: declared there without it, the server never starts (#4583).
-		if status == "wired" && c.name == "pi" && !piMCPAdapterInstalled() {
-			fmt.Fprintf(w, "  %-12s %-14s guidance %-11s %s\n", c.name, "no adapter", guidanceStatus(guidanceHarness(c.name)), reportPath(c.path))
-			fmt.Fprintf(w, "  %-12s %s\n", "", piNoAdapterNote)
-			continue
+		// A pi older than 0.99 has no MCP of its own and reads the file only
+		// through the adapter package; a newer one can have its built-in MCP
+		// switched off. Either way the server never starts (#4583).
+		if status == "wired" && c.name == "pi" {
+			if note := piMCPUnreadNote(); note != "" {
+				fmt.Fprintf(w, "  %-12s %-14s guidance %-11s %s\n", c.name, "no adapter", guidanceStatus(guidanceHarness(c.name)), reportPath(c.path))
+				fmt.Fprintf(w, "  %-12s %s\n", "", note)
+				continue
+			}
 		}
 		// WorkBuddy AI declares the server and starts it only once the user
 		// has clicked Trust for it (#4740).
@@ -1581,7 +1596,7 @@ func doctorMCP(w io.Writer) {
 		}
 		// Declared and switched off is not wired in any sense a session
 		// feels: the client never starts the server (#4303).
-		if status == "wired" && dejaEntrySwitchedOff(c.path) {
+		if status == "wired" && dejaEntrySwitchedOff(c.name, c.path) {
 			fmt.Fprintf(w, "  %-12s %s\n", "",
 				"the entry is switched off — "+c.name+" will not start it until you turn it back on")
 		}
@@ -1625,9 +1640,13 @@ func doctorMCPDuplicateNote(keys []string) string {
 
 // dejaEntrySwitchedOff reports whether every deja entry in a JSON config is
 // switched off — `disabled: true`, or opencode's `enabled: false`, the test
-// install uses. One entry still on is enough for recall to work.
-func dejaEntrySwitchedOff(path string) bool {
-	b, err := readConfig(path)
+// install uses. One entry still on is enough for recall to work. A client
+// that has no switch on the entry is never off by this test.
+func dejaEntrySwitchedOff(client, path string) bool {
+	if !entrySwitchHonored(client) {
+		return false
+	}
+	b, err := doctorReadConfig(path)
 	if err != nil {
 		return false
 	}
@@ -1642,7 +1661,7 @@ func dejaEntrySwitchedOff(path string) bool {
 				continue
 			}
 			entry, ok := v.(map[string]any)
-			if !ok || !entrySwitchedOff(entry) {
+			if !ok || !entrySwitchedOffFor(client, entry) {
 				return false
 			}
 			off = true
@@ -1676,7 +1695,7 @@ func dejaCommandMissing(path string) string {
 // thing in TOML, YAML and JSONC, and adding a parser per format to answer one
 // question is not worth the surface.
 func dejaCommandIn(path string) string {
-	b, err := readConfig(path)
+	b, err := doctorReadConfig(path)
 	if err != nil {
 		return ""
 	}
@@ -2418,9 +2437,11 @@ func doctorOpencodeConfigPath() string {
 	return path
 }
 
-// doctorOpenClawWired checks openclaw.json's nested mcp.servers map.
+// doctorOpenClawWired checks openclaw.json's nested mcp.servers map, with
+// any $include read in: an entry added by hand to the included file is the
+// wiring `deja install openclaw` asks for there (#5331).
 func doctorOpenClawWired(path string) bool {
-	b, err := readConfig(path)
+	b, err := doctorReadConfig(path)
 	if err != nil {
 		return false
 	}
@@ -2587,7 +2608,7 @@ func doctorTOMLDejaKeys(path string) []string {
 	}
 	found := map[string]bool{}
 	current := ""
-	for _, line := range strings.Split(string(b), "\n") {
+	for _, line := range tomlCodeLines(string(b)) {
 		if key, ok := tomlMCPHeader(line); ok {
 			current = key
 			if key == "deja" {
@@ -2687,7 +2708,7 @@ func doctorIndex(w io.Writer, idx doctorIndexReport, dir string) {
 			// A new home has no ~/.cache yet, and a build creates it: that
 			// is an index not built, not a disk that went away.
 			if freshHomePath(parent) {
-				fmt.Fprintln(w, "  status   not built (run `deja warmup`)")
+				fmt.Fprintln(w, notBuiltLine())
 				return
 			}
 			fmt.Fprintf(w, "  status   not reachable — %s is not there; the disk it lives on may have been unmounted\n", reportPath(parent))
@@ -2711,7 +2732,7 @@ func doctorIndex(w io.Writer, idx doctorIndexReport, dir string) {
 			fmt.Fprintf(w, "  status   not built — %s is not writable, so no build can run there; point DEJA_INDEX_DIR somewhere writable\n", filepath.Dir(dir))
 			return
 		}
-		fmt.Fprintln(w, "  status   not built (run `deja warmup`)")
+		fmt.Fprintln(w, notBuiltLine())
 		return
 	}
 	updated := "unknown"
@@ -2730,6 +2751,9 @@ func doctorIndex(w io.Writer, idx doctorIndexReport, dir string) {
 		read = ", stores read " + at.Local().Format("2006-01-02 15:04")
 	}
 	fmt.Fprintf(w, "  status   built (size=%s, updated=%s%s)\n", humanBytes(pathSize(dir)), updated, read)
+	if index.Manual() {
+		fmt.Fprintln(w, "  updates  automatic updates are off — only `deja index` writes the index")
+	}
 	// An index written by an older format is unreadable to this binary: the
 	// hook paths refuse it and ask for a rebuild, which is why memory goes
 	// quiet after an upgrade. doctor called that "up to date" — the one
@@ -3055,4 +3079,13 @@ func noPolicyFileLine() string {
 		return "no file at " + reportPath(p)
 	}
 	return "no policy file — deja cannot find a home directory to look in"
+}
+
+// notBuiltLine is doctor's line for an index not built yet. With automatic
+// indexing off warmup only reports, so it names the command that builds.
+func notBuiltLine() string {
+	if index.Manual() {
+		return "  status   not built, and automatic updates are off (run `deja index`)"
+	}
+	return "  status   not built (run `deja warmup`)"
 }

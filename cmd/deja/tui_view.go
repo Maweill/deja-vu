@@ -62,8 +62,6 @@ func (a *tuiApp) frame(w, h int) *tui.Canvas {
 		a.drawReader()
 	case viewWelcome:
 		a.drawWelcome()
-	case viewMemory:
-		a.drawMemory()
 	default:
 		a.drawList()
 	}
@@ -101,26 +99,16 @@ func (a *tuiApp) drawTop(l layout) {
 	if a.keptLoaded && len(a.kept) > 0 {
 		kept += " " + num(len(a.kept))
 	}
-	on1 := tui.Style{FG: cMantle, BG: cAcc, Bold: true, Reverse: p.mono}
 	for i, name := range []string{"This project", "All projects", kept} {
 		st := on(cSub, cMantle)
-		if i == a.scope && a.view != viewMemory {
-			st = on1
+		if i == a.scope {
+			st = tui.Style{FG: cMantle, BG: cAcc, Bold: true, Reverse: p.mono}
 		}
 		x0 := x
 		x = p.Put(x, 0, " "+name+" ", st, l.w) + 1
 		scope := i
-		a.addZone(x0, 0, x, 1, func() { a.view = viewList; a.setScope(scope) })
+		a.addZone(x0, 0, x, 1, func() { a.setScope(scope) })
 	}
-	// Memory is not a scope of the search: it is what the agents are told.
-	x = p.Put(x+1, 0, "│", on(cFaint, cMantle), l.w) + 2
-	st := on(cSub, cMantle)
-	if a.view == viewMemory {
-		st = on1
-	}
-	x0 := x
-	x = p.Put(x, 0, " Memory ", st, l.w) + 1
-	a.addZone(x0, 0, x, 1, a.openMemory)
 	right := a.status()
 	rw := termwidth.Columns(right)
 	if l.w-rw-2 > x+2 {
@@ -162,7 +150,11 @@ func (a *tuiApp) drawSearch(l layout, y int) {
 	case a.searching:
 		count = "…"
 	default:
-		count = num(len(a.rows))
+		n, more := a.listedCount()
+		count = num(n)
+		if more {
+			count += "+"
+		}
 	}
 	max := x1 - termwidth.Columns(count) - 2
 	x := 6
@@ -228,14 +220,12 @@ func (a *tuiApp) drawFooter() {
 	p.Fill(0, y, p.W, 1, cMantle)
 	var keys [][2]string
 	switch {
-	case a.view == viewMemory:
-		keys = [][2]string{{"↑↓", "pick"}, {"↵", "open session"}, {"x", "don't hand on"}, {"y", "hand on"}, {"type", "search"}, {"esc", "back"}}
 	case a.view == viewReader:
 		keys = [][2]string{{"↑↓", "scroll"}, {"/", "find"}, {"n N", "next hit"}, {"[ ]", "turns"}, {"r", "resume"}, {"o", "continue in…"}, {"t", "full messages"}, {"c", "copy"}, {"esc", "back"}}
 	case a.listFocus && len(a.rows) > 0:
 		keys = [][2]string{{"↵", "read"}, {"r", "resume"}, {"o", "continue in…"}, {"c", "copy context"}, {"a", "agents"}, {"/", "search"}, {"?", "help"}}
 	case len(a.query) > 0:
-		keys = [][2]string{{"↑↓", "pick"}, {"↵", "read"}, {"tab", "scope"}, {"^o", "continue in…"}, {"^k", "commands"}, {"esc", "clear"}}
+		keys = [][2]string{{"↑↓", "pick"}, {"↵", "read"}, {"tab", "scope"}, {"^o", "continue in…"}, {"^s", a.sortHint()}, {"^k", "commands"}, {"esc", "clear"}}
 	default:
 		keys = [][2]string{{"type", "search"}, {"↑↓", "pick"}, {"↵", "read"}, {"tab", "scope"}, {"^k", "commands"}, {"?", "help"}, {"esc", "quit"}}
 	}

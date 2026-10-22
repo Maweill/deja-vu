@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -27,7 +28,10 @@ type ForgetOptions struct {
 }
 
 type ForgetResult struct {
-	Sessions   int
+	Sessions int
+	// Attached is how many of Sessions are sub-agent runs kept in a matched
+	// session's own file and forgotten with it, not matches of the selector.
+	Attached   int
 	Messages   int
 	Tombstones int
 	// Keys of the sessions that matched, harness:id. The caller needs them to
@@ -306,6 +310,12 @@ func writeTombstoneMirrorAt(dir string, keys []string) error {
 	return os.Rename(tmp, path)
 }
 
+// inParentFile reports whether a session is a sub-agent run its harness keeps
+// inside the parent's own log: Copilot CLI's task runs (#5216).
+func inParentFile(harness, kind, parent string) bool {
+	return harness == "copilot" && kind == "sidechain" && parent != ""
+}
+
 func filterTombstoned(ss []model.Session) []model.Session {
 	return filterTombstonedSet(ss, readTombstones())
 }
@@ -317,6 +327,10 @@ func filterTombstonedSet(ss []model.Session, dead map[string]bool) []model.Sessi
 	out := make([]model.Session, 0, len(ss))
 	for _, s := range ss {
 		if dead[s.Harness+":"+s.ID] || s.FormerID != "" && dead[s.Harness+":"+s.FormerID] {
+			continue
+		}
+		// A run kept in a forgotten session's own file goes with it (#5216).
+		if inParentFile(s.Harness, s.Kind, s.Parent) && dead[s.Harness+":"+s.Parent] {
 			continue
 		}
 		out = append(out, s)
@@ -459,9 +473,21 @@ func Forget(dir string, o ForgetOptions) (ForgetResult, error) {
 	// is documented and useful, but it also made `forget --session s1` drop
 	// s1 and every s1x beside it — twelve sessions for a selector that named
 	// one, reported only afterwards (#870).
+	// A row set aside with nothing to index answers to the same selectors as
+	// a listed one: its title and project sit in manifest.gob, and its
+	// tombstone keeps the session out once it holds text (#5563).
+	rows := m.Sessions
+	if len(m.Empty) > 0 {
+		rows = maps.Clone(m.Sessions)
+		for key, meta := range m.Empty {
+			if _, listed := rows[key]; !listed {
+				rows[key] = meta
+			}
+		}
+	}
 	exact := ""
 	if o.Session != "" {
-		for _, meta := range m.Sessions {
+		for _, meta := range rows {
 			if meta.ID == o.Session {
 				exact = o.Session
 				break
@@ -476,7 +502,7 @@ func Forget(dir string, o ForgetOptions) (ForgetResult, error) {
 			}
 		}
 	}
-	for key, meta := range m.Sessions {
+	for key, meta := range rows {
 		if exact != "" && meta.ID != exact {
 			continue
 		}
@@ -486,6 +512,15 @@ func Forget(dir string, o ForgetOptions) (ForgetResult, error) {
 		matched[key] = true
 		result.Sessions++
 		result.Keys = append(result.Keys, key)
+		// A run kept in its parent's own log, matched along with the parent,
+		// is covered by the parent's tombstone (#5216): one of its own would
+		// outlive an unforget of the parent.
+		if inParentFile(meta.Harness, meta.Kind, meta.Parent) {
+			if pm, ok := m.Sessions[meta.Harness+":"+meta.Parent]; ok && (exact == "" || pm.ID == exact) && sessionMatches(pm, o) {
+				result.Attached++
+				continue
+			}
+		}
 		if meta.Harness == "deja" {
 			result.Notes++
 			if strings.HasPrefix(meta.ID, "deja-note-") {
@@ -501,6 +536,21 @@ func Forget(dir string, o ForgetOptions) (ForgetResult, error) {
 		if !o.DryRun {
 			dead[key] = true
 		}
+	}
+	// A sub-agent run kept in its parent's own file is part of that
+	// transcript: Copilot CLI writes a task's records into the parent's log,
+	// and before they were read as a session of their own they went with it
+	// (#5216). It takes no tombstone of its own. The parent's covers it, and
+	// the runs the log gains later, and unforgetting the parent brings the run
+	// back with it.
+	for key, meta := range m.Sessions {
+		if matched[key] || !inParentFile(meta.Harness, meta.Kind, meta.Parent) || !matched[meta.Harness+":"+meta.Parent] {
+			continue
+		}
+		matched[key] = true
+		result.Sessions++
+		result.Attached++
+		result.Keys = append(result.Keys, key)
 	}
 	// A compaction packet is retained transcript-derived state, not a
 	// searchable SessionMeta row. It still answers to the same privacy

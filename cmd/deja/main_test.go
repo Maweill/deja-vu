@@ -154,6 +154,15 @@ func TestCompletionScripts(t *testing.T) {
 			t.Fatalf("run(%q) succeeded, want error", args)
 		}
 	}
+	// A second argument is named, not reported as a missing shell (#5077).
+	if _, err := captureRun(t, "completion", "bash", "extra"); err == nil ||
+		err.Error() != `completion takes one shell, got "bash" and "extra"` {
+		t.Fatalf("run completion bash extra: %v", err)
+	}
+	if _, err := captureRun(t, "completion"); err == nil ||
+		!strings.Contains(err.Error(), "completion needs bash, zsh, fish, or powershell") {
+		t.Fatalf("run completion: %v", err)
+	}
 	powershell, err := captureRun(t, "completion", "powershell")
 	if err != nil {
 		t.Fatalf("run completion powershell: %v", err)
@@ -965,6 +974,7 @@ func TestInstallCodexTempHomePreservesOtherTOML(t *testing.T) {
 	h := t.TempDir()
 	t.Setenv("HOME", h)
 	t.Setenv("USERPROFILE", h)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
 	path := filepath.Join(h, ".codex", "config.toml")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
@@ -984,7 +994,8 @@ func TestInstallCodexTempHomePreservesOtherTOML(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ = os.ReadFile(path)
-	if strings.Count(string(b), "[mcp_servers.deja]") != 1 || !strings.Contains(string(b), `/new/deja`) {
+	// The entry names the launcher, and the launcher the new binary (#5269).
+	if strings.Count(string(b), "[mcp_servers.deja]") != 1 || !strings.Contains(string(b), hookExeInConfigs("/new/deja")) {
 		t.Fatalf("bad replace: %s", b)
 	}
 	if _, err := installTarget("codex", "/new/deja", true); err != nil {
@@ -1209,6 +1220,8 @@ func flagArgsFor(flag string) []string {
 		return []string{"--limit", "15", "q"}
 	case "--session":
 		return []string{"--session", "01a00feb", "q"}
+	case "--sort":
+		return []string{"--sort", "date", "q"}
 	default:
 		return []string{flag, "q"}
 	}

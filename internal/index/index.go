@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/vshulcz/deja-vu/internal/model"
+	"github.com/vshulcz/deja-vu/internal/query"
 )
 
 // version 12 resharded non-ASCII tokens across buckets; 13 interned the key
@@ -710,7 +711,108 @@ import (
 // 70: recoffsets.bin and frictext.bin sit beside the log. Both are caches
 // checked against it, so an index without them reads as before and needs no
 // rebuild for them.
-const version = 70
+// 71: Kimi Code 2.x sessions get their project and start time from
+// state.json, which names the directory cwd and stamps in milliseconds; the
+// rows already indexed have neither until a rebuild (#5143). Their first
+// prompt no longer opens with the empty <hook_result> wrappers of deja's own
+// hooks either, which is what titled them (#5144).
+// 72: a Gemini sub-agent's first turn no longer opens with the
+// <loaded_context> block Gemini puts ahead of its task; it titled every child
+// session already indexed (#5214).
+// 73: Qwen Code sub-agent logs are read by default, as Claude's are, so the
+// files they wrote have an author (#5223).
+// 74: a Copilot CLI sub-agent run is its own session under its parent and a
+// /fork names its source (#5216, #5217); rows already indexed hold neither
+// until a rebuild.
+// 75: a Grok --fork-session copy keeps only its own records, not the
+// source's it was started from (#5235); forks already indexed keep the copies
+// until a rebuild.
+// 76: a goose sub-agent run is read under the session that spawned it, and a
+// goose fork keeps only its own turns; both were indexed the old way
+// (#5232, #5233).
+// 77: a Kimi /fork keeps only its own turns under its source, a Kimi
+// sub-agent keeps its task and is read by default, and a relative Write/Edit
+// path sits under the session's cwd (#5226, #5227, #5228, #5229).
+// 78: a Grok --fork-session copy reads as a fork of its source, and a Grok
+// subagent hangs under the session whose subagent_spawned record names it
+// (#5263, #5264); rows already indexed hold neither until a rebuild.
+// 79: a Claude Code /branch is read as a fork of the session it names in
+// forkedFrom, which the rows already indexed do not carry until a rebuild
+// (#5241).
+// 80: a dsh sub-agent names its parent, and a session's spawned family is
+// left out of its recall at any depth; sub-agent rows already indexed hold no
+// parent until a rebuild.
+// 81: an opencode apply_patch with a relative header is filed under the
+// session's directory, as the tool resolved it; rows already indexed carry the
+// bare name until a rebuild (#5212).
+// 82: a Cursor CLI subagent transcript is read by default as its task,
+// answer and edits under the session that spawned it (#5243, #5244).
+// 83: a Hermes delegate_task child is a sub-agent of its parent whatever
+// source it ran under, files under its parent's project, and Hermes' relative
+// file paths sit under the session's directory (#5248, #5249, #5250).
+// 84: an OpenClaw heartbeat poll and its NO_REPLY are not turns, so a window
+// that only got polls is no longer a session (#5319).
+// 85: DEJA_INCLUDE_SUBAGENTS means the same in every reader: =0 leaves every
+// sub-agent run out, unset cuts it to task, edits and last turns (#5301).
+// 86: an OpenClaw JSONL sub-agent spawned before a /new stays under the window
+// that spawned it, not the key's newer one (#5307).
+// 87: an OpenClaw heartbeat poll answered HEARTBEAT_OK is not a turn (#5326).
+// 88: an OpenClaw JSONL sub-agent whose spawning window was archived as .zst
+// keeps it as its parent (#5340).
+// 89: ё is filed as е, and queries fold it the same way, so «ещё» and «еще»
+// are one word.
+// 90: a row names every transcript that holds its id, and a pass that
+// replaces the session reads them all (#5358).
+// 91: a Claude Code prompt no longer carries the <pasted_content id="…">
+// wrapper around pasted text, only the text. The tags titled sessions, gave
+// the install's demo question the topic "pasted_content set" and were indexed
+// as terms; the rebuild unwraps the sessions it carries from records.bin too
+// (deleted, compacted away, imported), and a sync import unwraps on arrival.
+// 92: a pass that replaces a few sessions appends their records and lists the
+// old ones as dead, and postings land in per-bucket overlay files, so a pass
+// writes what changed rather than the whole log and every bucket (#5387).
+// 93: rows of a session several transcripts hold match a rebuild: a deleted
+// transcript keeps the counts read while it was on disk and spans its own
+// records beside copies, a copy that leaves takes its span with it, and the
+// span of the files beside the owner no longer holds the owner's own (#5380).
+// 94: a deleted transcript keeps every turn it held beside a copy: a copy
+// that did not own the row is kept, a rebuild files shared turns under the
+// deleted file, and a rewrite of the live copy leaves them with it. A
+// renamed copy or one that moved to another id gives the row back to the
+// smallest path, and a file holding only the last turn is not a move
+// (#5441, #5442, #5443, #5444, #5445).
+// 95: the command tables count what the record log holds: a turn two copies
+// of a session share once, and of two transcripts sharing an id only the copy
+// the row names, and a pass takes the words it removes out of the neighbour
+// map (#5489, #5490, #5491).
+// 96: a copy that takes a shared row from a transcript in another directory
+// reads the old owner again, and copies read in one pass are written in path
+// order, so a turn they share is filed under the copy a rebuild gives it
+// (#5492).
+// 97: fixes are mined from what the record log holds, as the command tables
+// are: of two transcripts sharing an id only the copy the row names (#5504).
+// 98: a rebuild writes a kept transcript and the copy on disk of the same
+// session in the order the log held them, and takes a session's facts from
+// its commands in time order (#5519).
+// 99: a command whose clean result lands in the tail a pass appends is read
+// with its result, so it carries the exit 0 a rebuild gives it (#5527).
+// 100: a build's command tables go by the file each turn is filed under, a
+// deleted copy's included; a copy changed beside a later one in another
+// directory is read again with it when its tail holds a turn that copy has,
+// and an append that moves a shared row mines its runs again (#5508, #5509,
+// #5510).
+// 101: a build drops the kept file of a deleted transcript whose sessions were
+// all forgotten (#5521).
+// 102: a pass that re-reads a changed transcript drops a record that strips to
+// empty, as a rebuild does (#5555).
+// 103: an incremental pass gives no row to a session it holds no record of
+// (#5563).
+// 104: a Copilot agent transcript's insert_edit_into_file records what it
+// wrote (#595).
+// 105: an apply_patch rename files its hunks under the new name (#595).
+// 106: CodeWhale write_file and fim_edit, Crush lsp_replace_symbol and Reasonix
+// delete_symbol record the side of the change they used to drop (#595).
+const version = 106
 
 // onDiskFormat is how the store is laid out on disk — the record encoding, the
 // bucket encoding, the manifest's own shape. It moves only when a reader of an
@@ -725,7 +827,10 @@ const version = 70
 // "deja is rebuilding its index for this version — ask again then", and an
 // agent does not ask again (#1733 says so about the refresh case). Three of the
 // last four upgrades could have kept answering.
-const onDiskFormat = 2
+//
+// 3: dead records and postings overlay files (#5387). A reader of format 2
+// would serve the replaced records and miss the overlays.
+const onDiskFormat = 3
 const maxIndexedText = 64 * 1024
 
 // maxRecordSize bounds a single serialized record. A record is one message
@@ -802,8 +907,13 @@ type FileState struct {
 	MetadataMTime int64  `json:"metadata_mtime,omitempty"`
 	CWDSize       int64  `json:"cwd_size,omitempty"`
 	CWDMTime      int64  `json:"cwd_mtime,omitempty"`
-	LastUpdated   int64  `json:"last_updated,omitempty"`
-	Redactions    int    `json:"redactions,omitempty"`
+	// WALSize and WALMTime are a SQLite store's <db>-wal: writes land there
+	// and reach the database file only at a checkpoint, so a store whose
+	// file never changed still has new sessions in it (#5140).
+	WALSize     int64 `json:"wal_size,omitempty"`
+	WALMTime    int64 `json:"wal_mtime,omitempty"`
+	LastUpdated int64 `json:"last_updated,omitempty"`
+	Redactions  int   `json:"redactions,omitempty"`
 	// Kept marks a transcript its agent deleted and the index kept on
 	// purpose. Without it the listing came up one short on every run, the
 	// index never read as fresh, and every search served stale while a
@@ -838,6 +948,11 @@ type FileState struct {
 	// PrefixHash stays for manifests written before this existed; they verify
 	// the old way once, and the next walk records a sample.
 	PrefixSample uint64 `json:"prefix_sample,omitempty"`
+	// WrittenBack marks a transcript `deja resume --write-back` rebuilt from
+	// the index (#4617): it holds the conversation only, so a pass that reads
+	// a session's other copies again carries this one's records instead of
+	// reading it (#5358). It lasts while the file's size and mtime do.
+	WrittenBack bool `json:"written_back,omitempty"`
 }
 
 type SessionMeta struct {
@@ -888,6 +1003,10 @@ type SessionMeta struct {
 	// (#4574).
 	SharedStarted time.Time `json:",omitzero"`
 	SharedUpdated time.Time `json:",omitzero"`
+	// Copies are the other transcripts that hold this id, which a pass that
+	// replaces the session reads with the one that changed (#5358). Empty for
+	// a session one file holds, which is nearly all of them.
+	Copies []string `json:",omitempty"`
 	// OrigID is the id a session had on the machine it came from. Import
 	// renames every session to imported-<hash>, so a promoted note stopped
 	// looking like one the moment it crossed a machine boundary and every rule
@@ -1032,6 +1151,14 @@ type Manifest struct {
 	// A live index whose records.bin is shorter than this lost its tail to a
 	// torn write and must be treated as corrupt.
 	RecordsSize int64 `json:"records_size,omitempty"`
+	// DeadRecords are the offsets, ascending, of records a later pass
+	// replaced. A pass that replaces a few sessions appends their new records
+	// and lists the old ones here rather than writing the log again, and every
+	// walk of the log and every postings read skips them. DeadBytes is what
+	// they hold; past a quarter of the log the next replacing pass writes the
+	// log again without them (#5387).
+	DeadRecords []int64 `json:"dead_records,omitempty"`
+	DeadBytes   int64   `json:"dead_bytes,omitempty"`
 	// BucketFiles is how many postings files buckets/ held when the manifest
 	// was committed. Losing the whole directory was already caught (#946), but
 	// a partial copy or an interrupted sync leaves some files behind rather
@@ -1040,6 +1167,10 @@ type Manifest struct {
 	// index healthy (#1088). Additive: a manifest written before this decodes
 	// with it zero, and the check is skipped.
 	BucketFiles int `json:"bucket_files,omitempty"`
+	// bucketsLeaving is how many of the postings files on disk the pass
+	// committing this manifest removes right after: the count above leaves
+	// them out (#5426).
+	bucketsLeaving int
 	// IngestHealth records, per harness, what ingestion skipped on the pass
 	// that last touched it: malformed JSONL lines and files that failed to
 	// parse. Silent loss must be diagnosable (`deja doctor --json`).
@@ -1079,6 +1210,30 @@ type Manifest struct {
 	// local one, so a pass in another zone rereads them (#5053). Empty on a
 	// store from before the field, which says nothing.
 	ReadZone string `json:"read_zone,omitempty"`
+	// Deferred holds the transcripts a pass left unread because zstd was
+	// missing, with the state its walk saw. Not in Files: Files says what is
+	// indexed, and a rollout held there would read as unchanged the day zstd
+	// arrives. Left out of both, it read as changed on every pass, and every
+	// search rewrote the manifest for 1500 rollouts it still could not read
+	// (#5105). Additive: an older store decodes with it empty.
+	Deferred map[string]FileState `json:"deferred,omitempty"`
+	// PartialOf is set on the early index a big first build publishes before
+	// it finishes: how many sessions that build found, of which this index
+	// holds only the newest. An answer from it has to say the older ones are
+	// missing, not the newest (#5390). Zero on every complete index.
+	PartialOf int `json:"partial_of,omitempty"`
+	// SearchOnly says the build skipped the derived tables — fixes,
+	// co-occurrence, commands, command failures, session facts — because
+	// DEJA_SEARCH_ONLY or "search_only" asked it to (#5395). A reader of one
+	// of those tables says so rather than answering empty, and a pass whose
+	// setting differs rebuilds once.
+	SearchOnly bool `json:"search_only,omitempty"`
+	// Empty holds the rows of sessions with no record, a transcript that had
+	// nothing to index, out of Sessions so no reader lists them (#868,
+	// #5563). A pass takes one back when its id is read again: a Gemini
+	// resume stub's row carries its span and file to the transcript that
+	// takes the id later, as a rebuild reading both gives (#4213).
+	Empty map[string]SessionMeta `json:"empty,omitempty"`
 }
 
 // HarnessIngest is one harness's ingestion health from its last indexing pass.
@@ -1114,6 +1269,11 @@ type FileIngest struct {
 	// back only what changed, so a pass carries the rows it did not re-read
 	// instead of reporting them gone. Out of the JSON: the count is the contract.
 	Unusable map[string]string `json:"-"`
+	// Walk marks an Error the store walk found rather than a parser: a
+	// directory it could not list or a transcript it may not read. Only those
+	// are cleared by a later walk that reads the path, because a parse error
+	// on a file that has not changed is still the file's (#5393).
+	Walk bool `json:"-"`
 }
 
 type manifestCore struct {
@@ -1133,6 +1293,8 @@ type manifestCore struct {
 	ImportedRecords  map[string]bool
 	RecordStrings    []string
 	RecordsSize      int64
+	DeadRecords      []int64
+	DeadBytes        int64
 	BucketFiles      int
 	IngestHealth     map[string]HarnessIngest
 	IngestFiles      map[string]FileIngest
@@ -1142,6 +1304,10 @@ type manifestCore struct {
 	Compactions        map[string]CompactionState
 	KeptDated          bool
 	ReadZone           string
+	Deferred           map[string]FileState
+	PartialOf          int
+	SearchOnly         bool
+	Empty              map[string]SessionMeta
 }
 
 type RedactionStats struct {
@@ -1226,6 +1392,9 @@ type SearchResult struct {
 	// it that choice was made by counting terms, one each, and the two disagreed
 	// exactly when one rare word carried the session. Empty on every other tier.
 	TermIDF map[string]float64 `json:",omitempty"`
+	// Unread is set when Options.Window let the exact tier read only the
+	// sessions that can reach the page. The caller hands it to ranking.
+	Unread *query.Unread `json:",omitempty"`
 }
 
 // IsStrict says whether this session holds every word of the query rather
@@ -1250,6 +1419,8 @@ type importedState struct {
 	boundary    map[string][]uint64
 	dedupe      map[string]bool
 	compactions map[string]CompactionState
+	// partialOf: see Manifest.PartialOf.
+	partialOf int
 }
 
 type tokenJob struct {
@@ -1266,7 +1437,7 @@ type bucketPostings map[string]map[string][]posting
 // session objects in one indexing pass. Distinct messages (codex history
 // accumulation) pass through; format twins (gemini .json/.jsonl, cursor
 // multi-store composers) collapse.
-type msgSeen map[string]bool
+type msgSeen map[seenK]bool
 
 // recordWriter appends length-prefixed records through one buffer, tracking
 // the file offset in memory: the hot rebuild path used to pay a Seek syscall

@@ -76,7 +76,8 @@ func LoadTrae() []model.Session {
 	for _, s := range ss {
 		seen[s.ID] = true
 	}
-	if hist, _ := ParseTraeHistory(filepath.Join(TraeRoot(), "history.jsonl")); len(hist) > 0 {
+	histPath := filepath.Join(TraeRoot(), "history.jsonl")
+	if hist, err := ParseTraeHistory(histPath); len(storeRead(histPath, hist, err)) > 0 {
 		for _, h := range hist {
 			if !seen[h.ID] {
 				ss = append(ss, h)
@@ -264,7 +265,7 @@ func (tr *traeTurns) tool(s *model.Session, item map[string]any, cwd string, t t
 		if traeClaudeTool(s, item, t) {
 			return
 		}
-		codexCall(s, traeShellCall(item), calls, t)
+		codexCall(s, traeShellCall(item), calls, cwd, t)
 	case "function_call_output", "custom_tool_call_output":
 		codexCallOutput(s, traeOutput(item), calls, t)
 	case "custom_tool_call":

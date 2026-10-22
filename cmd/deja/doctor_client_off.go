@@ -22,9 +22,9 @@ import (
 func clientMCPEntryOff(name string) string {
 	switch name {
 	case "goose":
-		return yamlSwitchOff(filepath.Join(gooseConfigDir(), "config.yaml"), "goose", "extensions", "deja", "enabled")
+		return gooseMCPOffNote(filepath.Join(gooseConfigDir(), "config.yaml"))
 	case "hermes":
-		return yamlSwitchOff(filepath.Join(sources.HermesHome(), "config.yaml"), "hermes", "mcp_servers", "deja", "enabled")
+		return hermesMCPOffNote(filepath.Join(sources.HermesHome(), "config.yaml"))
 	case "codex", "grok":
 		home := sources.CodexHome()
 		if name == "grok" {
@@ -116,10 +116,9 @@ func clientMCPDenied(name string) string {
 			return mcpOffNote(name, "`features.mcp: false`", zcodeConfigPath())
 		}
 	case "openclaw":
-		p := filepath.Join(sources.OpenClawStateDir(), "openclaw.json")
-		for _, s := range jsonStrings(jsonAt(readJSONConfig(p), "tools", "deny")) {
+		for _, s := range jsonStrings(jsonAt(openclawDoctorRoot(), "tools", "deny")) {
 			if s == "bundle-mcp" || s == "*" {
-				return mcpOffNote(name, "`tools.deny` holds "+s, p)
+				return mcpOffNote(name, "`tools.deny` holds "+s, openclawFileFor("tools", "deny"))
 			}
 		}
 	case "opencode":
@@ -222,19 +221,33 @@ func clientHooksOff(name string) string {
 			}
 		}
 	case "openclaw":
-		p := filepath.Join(sources.OpenClawStateDir(), "openclaw.json")
-		root := readJSONConfig(p)
+		root := openclawDoctorRoot()
 		switch {
 		case jsonAt(root, "hooks", "internal", "enabled") == false:
-			return hooksOffNote(name, "`hooks.internal.enabled: false`", p)
+			return hooksOffNote(name, "`hooks.internal.enabled: false`", openclawFileFor("hooks", "internal", "enabled"))
 		case jsonAt(root, "hooks", "internal", "entries", openclawHookName, "enabled") == false:
-			return pluginOffNote(name, "`hooks.internal.entries."+openclawHookName+".enabled: false`", p)
+			return pluginOffNote(name, "`hooks.internal.entries."+openclawHookName+".enabled: false`", openclawFileFor("hooks", "internal", "entries", openclawHookName, "enabled"))
 		}
 		// The plugin is the per-prompt half; the hook pack above still runs
 		// at bootstrap without it.
-		if jsonAt(root, "plugins", "entries", openclawPluginID, "enabled") == false || listHasDeja(jsonAt(root, "plugins", "deny")) {
-			return "switched off: deja's plugin, by `plugins.entries` or `plugins.deny` in " + reportPath(p) +
+		// OpenClaw's own order: the master switch, the deny list, the entry,
+		// then a non-empty allow list that does not name the plugin.
+		if jsonAt(root, "plugins", "enabled") == false {
+			return "switched off: `plugins.enabled: false` in " + reportPath(openclawFileFor("plugins", "enabled")) +
+				" — openclaw loads no plugins, so deja's recall on each prompt never runs"
+		}
+		if jsonAt(root, "plugins", "entries", openclawPluginID, "enabled") == false || anyDeja(openclawPluginList(root, "deny")) {
+			return "switched off: deja's plugin, by `plugins.entries` or `plugins.deny` in " + reportPath(openclawFileFor("plugins", "entries")) +
 				" — openclaw will not run its recall on each prompt"
+		}
+		// A memory or context-engine slot naming deja loads it past the list.
+		slot := func(k string) bool {
+			s, _ := jsonAt(root, "plugins", "slots", k).(string)
+			return strings.TrimSpace(s) == openclawPluginID
+		}
+		if allow := openclawPluginList(root, "allow"); len(allow) > 0 && !anyDeja(allow) && !slot("memory") && !slot("contextEngine") {
+			return "blocked: `plugins.allow` in " + reportPath(openclawFileFor("plugins", "allow")) + " does not name deja, so openclaw keeps deja's plugin off" +
+				" and runs no recall on each prompt — add \"deja\" to it"
 		}
 		// From 2026.8.1 the gateway drops the plugin's prompt hooks without the
 		// grant, and says so only in its own log.
@@ -242,6 +255,7 @@ func clientHooksOff(name string) string {
 		if jsonAt(root, "plugins", "entries", openclawPluginID) != nil && grant != true {
 			if v := openclawVersion(); v == "" || openclawVersionAtLeast(v, openclawAccessGate) {
 				what := "`plugins.entries.deja.hooks." + openclawAccessKey + "`"
+				p := openclawFileFor("plugins", "entries", openclawPluginID, "hooks", openclawAccessKey)
 				if grant == false {
 					return "switched off: " + what + " is false in " + reportPath(p) +
 						" — OpenClaw " + openclawAccessGate + "+ then drops deja's per-prompt recall"

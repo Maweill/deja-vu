@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -34,7 +35,7 @@ func installOpenClawPlugin(exe string, uninstall bool) (installResult, error) {
 	// config as a hooks.json, and one that names the build it was
 	// installed from stops working the day that build moves (#3682).
 	exe = hookExeFor(exe, uninstall)
-	dir := filepath.Join(sources.OpenClawStateDir(), "extensions", openclawPluginID)
+	dir := openclawPluginDir()
 	if uninstall {
 		// Same as the hook pack beside it: say what happened, and take the
 		// directories deja made above this one (#3698).
@@ -54,29 +55,7 @@ func installOpenClawPlugin(exe string, uninstall bool) (installResult, error) {
 		pruneCreatedDir(filepath.Dir(dir))
 		return installResult{Path: dir, Action: "removed"}, nil
 	}
-	noteCreatedDirs(dir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return installResult{}, err
-	}
-	for _, f := range []struct{ name, body string }{
-		{"package.json", openclawPluginPackage()},
-		{"openclaw.plugin.json", openclawPluginManifest()},
-	} {
-		path := filepath.Join(dir, f.name)
-		old, err := readConfig(path)
-		if err != nil {
-			return installResult{}, err
-		}
-		if _, err := writeIfChanged(path, old, []byte(f.body)); err != nil {
-			return installResult{}, err
-		}
-	}
-	entry := filepath.Join(dir, "index.mjs")
-	old, err := readConfig(entry)
-	if err != nil {
-		return installResult{}, err
-	}
-	a, err := writeIfChanged(entry, old, []byte(openclawPluginJS(exe)))
+	entry, a, err := writeOpenClawPluginFiles(exe)
 	if err != nil {
 		return installResult{}, err
 	}
@@ -93,6 +72,36 @@ func installOpenClawPlugin(exe string, uninstall bool) (installResult, error) {
 	// said "unchanged".
 	return wroteAll(installResult{Path: entry, Action: a},
 		installResult{Path: dir, Action: a}, cfg), nil
+}
+
+// writeOpenClawPluginFiles writes the plugin's directory, which is deja's
+// own, and nothing in openclaw.json: the entry point and what was done to it.
+func writeOpenClawPluginFiles(exe string) (string, string, error) {
+	dir := openclawPluginDir()
+	noteCreatedDirs(dir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", "", err
+	}
+	for _, f := range []struct{ name, body string }{
+		{"package.json", openclawPluginPackage()},
+		{"openclaw.plugin.json", openclawPluginManifest()},
+	} {
+		path := filepath.Join(dir, f.name)
+		old, err := readConfig(path)
+		if err != nil {
+			return "", "", err
+		}
+		if _, err := writeIfChanged(path, old, []byte(f.body)); err != nil {
+			return "", "", err
+		}
+	}
+	entry := filepath.Join(dir, "index.mjs")
+	old, err := readConfig(entry)
+	if err != nil {
+		return "", "", err
+	}
+	a, err := writeIfChanged(entry, old, []byte(openclawPluginJS(exe)))
+	return entry, a, err
 }
 
 // setOpenClawPluginEntry writes our entry under plugins.entries, leaving
@@ -308,7 +317,30 @@ func openclawLoadPathsJSONC(text, dir string, on bool, kept, loadKeys, pluginKey
 		}
 		return text[:last+1] + ", " + string(elem) + text[last+1:], nil
 	}
-	// The strings at the list's own level that name dir, last first so the
+	next, err := jsoncCutListStrings(text, *at, func(s string) bool { return openclawSamePath(s, dir) })
+	if err != nil {
+		return "", fmt.Errorf("plugins.load.paths %w", err)
+	}
+	return next, nil
+}
+
+// jsoncCutListStrings takes the strings match picks out of the list at at
+// (from its '[' to one past its ']') as text: the other elements keep their
+// comments and commas. Its error names no list: the caller says which.
+// A list left empty stays as `[]`; dropping the key is
+// the caller's call.
+func jsoncCutListStrings(text string, at [2]int, match func(string) bool) (string, error) {
+	blank := stripJSONComments(text)
+	// The last thing in the list that is not space or a comment.
+	prevSig := func(i int) int {
+		for i--; i > at[0]; i-- {
+			if c := blank[i]; c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+				break
+			}
+		}
+		return i
+	}
+	// The strings at the list's own level that match, last first so the
 	// offsets of the ones before stay good.
 	var hits [][2]int
 	depth := 0
@@ -321,37 +353,59 @@ func openclawLoadPathsJSONC(text, dir string, on bool, kept, loadKeys, pluginKey
 		case '"':
 			end := zedStringEnd(text, i)
 			if end < 0 {
-				return "", fmt.Errorf("plugins.load.paths has an open string")
+				return "", errors.New("has an open string")
 			}
 			var s string
-			if depth == 0 && json.Unmarshal([]byte(text[i:end]), &s) == nil && openclawSamePath(s, dir) {
+			if depth == 0 && json.Unmarshal([]byte(text[i:end]), &s) == nil && match(s) {
 				hits = append(hits, [2]int{i, end})
 			}
 			i = end - 1
 		}
 	}
+	space := func(c byte) bool { return c == ' ' || c == '\t' }
 	for k := len(hits) - 1; k >= 0; k-- {
 		from, to := hits[k][0], hits[k][1]
-		if p := prevSig(from); blank[p] == ',' {
-			// The comma before it, and the space between.
-			from = p
-		} else {
-			// The first element: the comma after it, and the space up to the
-			// next one.
-			j := to
-			for j < at[1]-1 && (blank[j] == ' ' || blank[j] == '\t' || blank[j] == '\n' || blank[j] == '\r') {
-				j++
-			}
-			if blank[j] == ',' {
-				to = j + 1
-				for to < at[1]-1 && (blank[to] == ' ' || blank[to] == '\t') {
-					to++
-				}
-			}
+		comma := -1
+		j := to
+		for j < at[1]-1 && (space(blank[j]) || blank[j] == '\n' || blank[j] == '\r') {
+			j++
 		}
+		if blank[j] == ',' {
+			// The comma after it, and the space up to the next element.
+			to = j + 1
+			for to < at[1]-1 && space(text[to]) {
+				to++
+			}
+		} else if p := prevSig(from); blank[p] == ',' {
+			// The last element: the comma before it goes, and only the
+			// comma. A comment the reader put between it and deja's entry
+			// is theirs and stays where they wrote it.
+			comma = p
+		}
+		// The entry's line goes whole when nothing else is left on it.
+		s, e := from, to
+		for s > 0 && space(text[s-1]) {
+			s--
+		}
+		for e < len(text) && space(text[e]) {
+			e++
+		}
+		if s > 0 && text[s-1] == '\n' && e < len(text) && (text[e] == '\n' || text[e] == '\r') {
+			if text[e] == '\r' && e+1 < len(text) && text[e+1] == '\n' {
+				e++
+			}
+			from, to = s, e+1
+		} else if comma >= 0 {
+			from = s
+		}
+		cut := to - from
 		text = text[:from] + text[to:]
+		if comma >= 0 {
+			text = text[:comma] + text[comma+1:]
+			cut++
+		}
 		blank = stripJSONComments(text)
-		at[1] -= to - from
+		at[1] -= cut
 	}
 	return text, nil
 }
@@ -664,6 +718,7 @@ export default {
     if (typeof api.registerAgentToolResultMiddleware === "function") {
       api.registerAgentToolResultMiddleware(async (event, ctx) => {
         try {
+          if (ctx?.trigger === "heartbeat") return;
           const line = toolLine(event, ctx);
           if (!line) return;
           const content = Array.isArray(event?.result?.content) ? event.result.content : [];
@@ -689,6 +744,7 @@ export default {
         cwd: at.cwd,
         source: "startup",
         deja_once: true,
+        deja_prompt_stamps: true,
       });
     };
     // By default every DM shares agent:main:main, so a receipt is tied to the
@@ -745,6 +801,10 @@ export default {
       async (event, ctx) => {
         const prompt = typeof event?.prompt === "string" ? event.prompt.trim() : "";
         if (!prompt) return;
+        // A heartbeat poll is not a turn anyone asked for: recall on its
+        // prompt has nothing to answer, and the stamp it wrote hid the
+        // session from the user's other sessions for twenty minutes (#5270).
+        if (ctx?.trigger === "heartbeat") return;
         // Recall skips what it already showed this agent session, keyed by the
         // session id. A payload without one turns that off: measured on a real
         // store, half of all injections were then a word-for-word repeat. The
@@ -820,7 +880,7 @@ export default {
       "session_end",
       async (event, ctx) => {
         const id = event?.sessionId || ctx?.sessionId || event?.sessionKey || ctx?.sessionKey || "";
-        if (id) ask(["hook-session-end"], { session_id: id });
+        if (id) ask(["hook-session-end"], { session_id: id, cwd: ctx?.workspaceDir || seen.get(ctx?.sessionKey || "")?.dir || process.cwd() });
       },
       { timeoutMs: 5000 },
     );

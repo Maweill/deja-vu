@@ -33,8 +33,6 @@ func (a *tuiApp) handle(ev tui.Event) {
 		a.handleReader(ev)
 	case a.view == viewWelcome:
 		a.handleWelcome(ev)
-	case a.view == viewMemory:
-		a.handleMemory(ev)
 	default:
 		a.handleList(ev)
 	}
@@ -79,17 +77,9 @@ func (a *tuiApp) handleList(ev tui.Event) {
 	case tui.KeyEnd:
 		a.move(len(a.rows))
 	case tui.KeyTab:
-		if a.scope == scopeKept {
-			a.openMemory()
-			return
-		}
-		a.setScope(a.scope + 1)
+		a.setScope((a.scope + 1) % 3)
 	case tui.KeyBackTab:
-		if a.scope == scopeHere {
-			a.openMemory()
-			return
-		}
-		a.setScope(a.scope - 1)
+		a.setScope((a.scope + 2) % 3)
 	case tui.KeyEnter:
 		if len(a.rows) == 0 && a.takeWayOut() {
 			return
@@ -157,6 +147,8 @@ func (a *tuiApp) ctrlKey(r rune) {
 		a.move(1)
 	case 'p':
 		a.move(-1)
+	case 's':
+		a.toggleSort()
 	}
 }
 
@@ -187,8 +179,12 @@ func (a *tuiApp) listAction(r rune) bool {
 		a.copyProjectPath()
 	case 'F':
 		a.askForget()
+	case 'D':
+		a.askDelete()
 	case 'a':
 		a.openModal(modalAgents)
+	case 's':
+		a.toggleSort()
 	case '?':
 		a.openModal(modalHelp)
 	case 'q':
@@ -213,6 +209,9 @@ func (a *tuiApp) move(d int) {
 		a.sel = len(a.rows) - 1
 	}
 	a.want(a.rows[a.sel].s)
+	if d > 0 {
+		a.loadMore()
+	}
 }
 
 func (a *tuiApp) setScope(s int) {

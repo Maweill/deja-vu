@@ -41,7 +41,7 @@ func installHermesMemoryProvider(exe string, uninstall bool) (installResult, err
 		// And the directories deja made above it, while each is empty and
 		// the record says it is deja's (#3698).
 		pruneCreatedDir(filepath.Dir(dir))
-		return installResult{Path: dir, Action: "removed"}, nil
+		return installResult{Path: dir, Action: "removed", Note: hermesProviderLeftNote()}, nil
 	}
 	noteCreatedDirs(dir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -179,7 +179,11 @@ RECALL_SCHEMA = {
             "query": {
                 "type": "string",
                 "description": "Error text, identifier, command or a short description of the problem.",
-            }
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Sessions to skip, from the offset the previous page named. Default 0.",
+            },
         },
         "required": ["query"],
     },
@@ -247,6 +251,21 @@ def _bounded_messages(messages, limit=768 * 1024):
         out.append(m)
     out.reverse()
     return out
+
+
+def _recall_args(args):
+    # The page the MCP recall tool serves, framed and held to its 4 KB budget
+    # by deja itself; search grew with the hits, 16 KB for its default
+    # fifteen (#5568). The page ends naming the offset of the rest; --offset
+    # is sent only past the first page, so a deja too old to know it still
+    # answers the first one.
+    try:
+        offset = min(int(args.get("offset") or 0), 10**9)
+    except (TypeError, ValueError, OverflowError):
+        offset = 0
+    flags = ["--offset", str(offset)] if offset > 0 else []
+    command = _query_args("recall", args.get("query", ""))
+    return command[:1] + flags + command[1:]
 
 
 def _query_args(command, text):
@@ -442,7 +461,7 @@ class DejaMemoryProvider(MemoryProvider):
         # recall can answer with it now rather than twenty minutes from now.
         sid = getattr(self, "_session_id", "")
         if sid:
-            _deja(["hook-session-end"], json.dumps({"session_id": sid}), timeout=3)
+            _deja(["hook-session-end"], json.dumps({"session_id": sid, "cwd": os.getcwd()}), timeout=3)
 
     def on_pre_compress(self, messages) -> str:
         # Held until the compression commits: Hermes can still abandon it, and
@@ -488,10 +507,15 @@ class DejaMemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         # A tool the model just asked for can wait: a first search may rebuild
         # the index, which took 18s on a large machine. The per-turn hooks
-        # above never build. --framed because what these print is written for
-        # a person: the model gets it inside deja's untrusted-data frame.
+        # above never build. fix and blame print for a person, so --framed puts
+        # it inside deja's untrusted-data frame; recall frames its own page.
         if tool_name == "deja_recall":
-            text = _deja(["--framed"] + _query_args("search", args.get("query", "")), timeout=120)
+            call = _recall_args(args)
+            text = _deja(call, timeout=120)
+            if not text and "--offset" in call:
+                # recall always prints a line; silence past the first page is
+                # a deja older than --offset refusing the flag.
+                text = "This deja cannot page recall. Run deja update, then ask again with the same offset."
         elif tool_name == "deja_fix":
             text = _deja(["--framed"] + _query_args("fix", args.get("error", "")), timeout=120)
         elif tool_name == "deja_blame":
