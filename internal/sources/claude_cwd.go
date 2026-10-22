@@ -130,7 +130,8 @@ func claudeProjectNameFor(path string) string {
 func claudeCachedProjectName(dir, path string) (string, bool) {
 	// Its own cache, keyed by the folder: the shared one is keyed by an
 	// encoded name other harnesses' folders can share, and an entry decoded
-	// for one of them would answer for this one.
+	// for one of them would answer for this one. An alias file edit drops it.
+	loadProjectAliases()
 	if v, ok := claudeCWDNameCache.Load(dir); ok {
 		return v.(string), true
 	}
@@ -169,6 +170,14 @@ func cwdProjectName(cwd string) string {
 	}
 	if name, ok := ProjectAliasFor(cwd); ok {
 		return name
+	}
+	return plainCWDProjectName(cwd)
+}
+
+// plainCWDProjectName is cwdProjectName without the alias file.
+func plainCWDProjectName(cwd string) string {
+	if p, ok := fileURIPath(cwd); ok {
+		cwd = p
 	}
 	segs := dropChatFolder(strings.FieldsFunc(cwd, func(r rune) bool { return r == '/' || r == '\\' }))
 	switch {

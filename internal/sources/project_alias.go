@@ -2,11 +2,15 @@ package sources
 
 import (
 	"bufio"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,31 +36,99 @@ type projectAlias struct{ root, name string }
 
 // projectAliases is the parsed file. Each ask stats it and parses it again only
 // when the stat says it changed, so an index pass does not reopen it per
-// session and a long-lived `deja mcp` sees an edit without a restart.
-var projectAliases struct {
-	sync.Mutex
+// session and a long-lived `deja mcp` sees an edit without a restart. The
+// unchanged case reads a snapshot without a lock: a build asks from every core.
+var (
+	projectAliases       atomic.Pointer[aliasSnapshot]
+	projectAliasesReload sync.Mutex
+)
+
+type aliasSnapshot struct {
 	path string
 	mod  time.Time
-	size int64
+	size int64 // -1: no file
 	list []projectAlias
 }
 
 func loadProjectAliases() []projectAlias {
 	path := ProjectAliasPath()
-	fi, err := os.Stat(path)
-	projectAliases.Lock()
-	defer projectAliases.Unlock()
-	if err != nil {
-		projectAliases.path, projectAliases.mod, projectAliases.size, projectAliases.list = path, time.Time{}, 0, nil
-		return nil
+	mod, size := time.Time{}, int64(-1)
+	if fi, err := os.Stat(path); err == nil {
+		mod, size = fi.ModTime(), fi.Size()
 	}
-	if projectAliases.path == path && projectAliases.mod.Equal(fi.ModTime()) && projectAliases.size == fi.Size() {
-		return projectAliases.list
+	if s := projectAliases.Load(); s != nil && s.path == path && s.size == size && s.mod.Equal(mod) {
+		if len(s.list) > 0 {
+			// The cached names carry the exclude-first decision too, so an
+			// exclude edit drops them like an alias edit does.
+			aliasExcluder()
+		}
+		return s.list
 	}
-	list := readProjectAliases(path)
-	projectAliases.path, projectAliases.mod, projectAliases.size, projectAliases.list = path, fi.ModTime(), fi.Size(), list
+	projectAliasesReload.Lock()
+	defer projectAliasesReload.Unlock()
+	old := projectAliases.Load()
+	if old != nil && old.path == path && old.size == size && old.mod.Equal(mod) {
+		return old.list
+	}
+	var list []projectAlias
+	if size >= 0 {
+		list = readProjectAliases(path)
+	}
+	if old != nil && !sameAliases(list, old.list) {
+		forgetProjectNames()
+	}
+	projectAliases.Store(&aliasSnapshot{path: path, mod: mod, size: size, list: list})
 	return list
 }
+
+func sameAliases(a, b []projectAlias) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// forgetProjectNames drops the folder names worked out under the old file, so
+// a long-lived process does not keep naming a folder after an alias that is
+// gone.
+func forgetProjectNames() {
+	for _, m := range []*sync.Map{&projectNameCache, &claudeCWDNameCache} {
+		m.Range(func(k, _ any) bool {
+			m.Delete(k)
+			return true
+		})
+	}
+}
+
+// ProjectAliasFingerprint identifies the aliases in force, so an index can
+// record which ones it was built under: they apply when a session is indexed,
+// and an edit renames nothing already in the index until a rebuild. "none"
+// with no file or no valid line; comments and line order do not count.
+func ProjectAliasFingerprint() string {
+	list := loadProjectAliases()
+	if len(list) == 0 {
+		return "none"
+	}
+	lines := make([]string, len(list))
+	for i, a := range list {
+		lines[i] = a.root + "\x00" + a.name
+	}
+	sort.Strings(lines)
+	h := fnv.New64a()
+	for _, l := range lines {
+		_, _ = h.Write([]byte(l))
+		_, _ = h.Write([]byte{0})
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
+// ProjectAliasCount is how many trees the file names.
+func ProjectAliasCount() int { return len(loadProjectAliases()) }
 
 // readProjectAliases parses `<path> = <name>` lines. The last "=" splits them,
 // since a path may hold one and a name has no reason to. Blank lines, comments,
@@ -90,7 +162,23 @@ func readProjectAliases(path string) []projectAlias {
 }
 
 // ProjectAliasFor is the project the alias file names for dir, if any.
+//
+// The exclude file wins: a directory whose own name an exclude pattern matches
+// keeps that name, so the pattern still takes it out. Renamed to the tree's
+// alias it would slip past a rule written before the alias was.
 func ProjectAliasFor(dir string) (string, bool) {
+	name, ok := aliasFor(dir)
+	if ok && aliasExcluder().Match(plainCWDProjectName(dir)) {
+		return "", false
+	}
+	return name, ok
+}
+
+func aliasFor(dir string) (string, bool) {
+	// A file URI's path keeps a slash before the drive, /c:/Users/x.
+	if runtime.GOOS == "windows" && len(dir) >= 3 && (dir[0] == '/' || dir[0] == '\\') && dir[2] == ':' {
+		dir = dir[1:]
+	}
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
 		return "", false
@@ -123,3 +211,33 @@ func pathUnder(dir, root string) bool {
 	}
 	return strings.HasPrefix(dir, root)
 }
+
+// aliasExcluder is the exclude patterns, read again only when the file or the
+// variable changes: an aliased directory asks once per session indexed.
+func aliasExcluder() Excluder {
+	key := excludeKey{path: ExcludePath(), env: os.Getenv("DEJA_EXCLUDE_PROJECTS"), size: -1}
+	if fi, err := os.Stat(key.path); err == nil {
+		key.mod, key.size = fi.ModTime(), fi.Size()
+	}
+	if c := aliasExclude.Load(); c != nil && c.key.path == key.path && c.key.env == key.env && c.key.size == key.size && c.key.mod.Equal(key.mod) {
+		return c.ex
+	}
+	ex := NewExcluder()
+	if aliasExclude.Swap(&cachedExcluder{key: key, ex: ex}) != nil {
+		forgetProjectNames()
+	}
+	return ex
+}
+
+type excludeKey struct {
+	path, env string
+	mod       time.Time
+	size      int64
+}
+
+type cachedExcluder struct {
+	key excludeKey
+	ex  Excluder
+}
+
+var aliasExclude atomic.Pointer[cachedExcluder]

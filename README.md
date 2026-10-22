@@ -649,10 +649,13 @@ hooks recall only from the one they stand in. List the trees in
 ```
 
 Every directory under a listed path is then that project, for indexing, the
-hooks and recall alike; the longest matching path wins. Sessions already indexed
-keep their old name until `deja index --rebuild`; `deja remember` notes keep the
-name they were filed under. Patterns in the exclude file match the name the
-alias gives.
+hooks and recall alike; the longest matching path wins. Editing the file renames
+nothing already indexed: `deja index` and `deja doctor` say when a rebuild is
+due, and `deja index --rebuild` files the sessions whose transcripts are still on
+disk under the new name. Sessions indexed before the file existed still match
+from their own checkout until then; kept sessions whose transcript is gone, and
+`deja remember` notes, keep the name they were filed under. The exclude file wins: a repository excluded by
+its own name stays out, and a pattern for the alias name excludes the whole tree.
 
 </details>
 
